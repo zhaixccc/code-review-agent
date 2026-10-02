@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROMPT_VERSION = "3"  # bump when prompts change so cached model results are not reused
+PROMPT_VERSION = "4"  # bump when prompts change so cached model results are not reused
 
 FILE_REVIEW_SYSTEM = """You are a senior software engineer reviewing ONE file of a code change.
 
@@ -27,6 +27,9 @@ Impact rules (only when <impact_evidence> is present):
   Quote the caller as path:line in "detail" and set "line" to the changed line in THIS file.
 - If the excerpt is compatible, or you cannot tell, do not report it. Never invent callers that are not listed.
 - A signature change with callers in files NOT modified by this change is the highest-value thing to verify.
+- Each caller carries a tag. "imports the changed file" (or "same package") is strong evidence that the use refers to
+  the changed symbol. A caller without a tag may or may not. "defines its own symbol with the same name and does not
+  import the changed file: likely unrelated" almost certainly calls something else: do not report those.
 
 Rules:
 - Only comment on added or changed code. Do not praise. Do not restate the code. Skip pure style opinions

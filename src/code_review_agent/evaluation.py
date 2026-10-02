@@ -174,6 +174,44 @@ CASES: tuple[EvalCase, ...] = (
         },
     ),
     EvalCase(
+        name="py_same_name_unrelated",
+        category="clean",
+        description="The signature changes and its real caller is updated, but another module has its own unrelated function "
+        "with the same name. That module's calls must not be reported as broken.",
+        message="Add currency to apply_discount",
+        base={
+            "billing/pricing.py": 'def apply_discount(price, rate):\n    return round(price * (1 - rate), 2)\n',
+            "orders/checkout.py": 'from billing.pricing import apply_discount\n\n\ndef checkout(total, rate):\n    return apply_discount(total, rate)\n',
+            "loyalty/points.py": 'def apply_discount(points):\n    return points // 2\n\n\ndef redeem(points):\n    return apply_discount(points)\n',
+            "loyalty/report.py": 'from loyalty.points import apply_discount\n\n\ndef report(points):\n    return apply_discount(points)\n',
+        },
+        head={
+            "billing/pricing.py": 'def apply_discount(price, rate, currency):\n    return round(price * (1 - rate), 2)\n',
+            "orders/checkout.py": 'from billing.pricing import apply_discount\n\n\ndef checkout(total, rate):\n    return apply_discount(total, rate, "USD")\n',
+            "loyalty/points.py": 'def apply_discount(points):\n    return points // 2\n\n\ndef redeem(points):\n    return apply_discount(points)\n',
+            "loyalty/report.py": 'from loyalty.points import apply_discount\n\n\ndef report(points):\n    return apply_discount(points)\n',
+        },
+    ),
+    EvalCase(
+        name="ts_same_name_unrelated",
+        category="clean",
+        description="A TypeScript function gains a parameter and its caller is updated; an unrelated module has its own "
+        "function of the same name that is called without the new parameter.",
+        message="Localise price formatting",
+        base={
+            "src/money/format.ts": "export function formatPrice(amount: number): string {\n  return `$${amount.toFixed(2)}`;\n}\n",
+            "src/money/cart.ts": "import { formatPrice } from './format';\n\nexport function renderTotal(total: number): string {\n  return formatPrice(total);\n}\n",
+            "src/points/format.ts": "export function formatPrice(points: number): string {\n  return `${points} pts`;\n}\n",
+            "src/points/badge.ts": "import { formatPrice } from './format';\n\nexport function badge(points: number): string {\n  return formatPrice(points);\n}\n",
+        },
+        head={
+            "src/money/format.ts": "export function formatPrice(amount: number, locale: string): string {\n  return new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD' }).format(amount);\n}\n",
+            "src/money/cart.ts": "import { formatPrice } from './format';\n\nexport function renderTotal(total: number): string {\n  return formatPrice(total, 'en-US');\n}\n",
+            "src/points/format.ts": "export function formatPrice(points: number): string {\n  return `${points} pts`;\n}\n",
+            "src/points/badge.ts": "import { formatPrice } from './format';\n\nexport function badge(points: number): string {\n  return formatPrice(points);\n}\n",
+        },
+    ),
+    EvalCase(
         name="py_clean_internal_change",
         category="clean",
         description="A private helper changes internally; its only user is the same file and is consistent.",

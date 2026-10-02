@@ -1,10 +1,15 @@
-"""Syntax-tree code navigation (tree-sitter): definitions and name-based references.
+"""Syntax-tree code navigation (tree-sitter): definitions, name-based references and imports.
 
 This is the deterministic half of impact analysis: it finds *where* a changed symbol is defined and *who* mentions it.
 Matching is by name (like Aider's repo map or tree-sitter "tags"), not by resolved types, so callers can include
 unrelated symbols that share the name. Callers must treat results as evidence to inspect, not as proof.
 
 Source text is only parsed, never executed. A missing grammar package or a parse failure degrades to "no results".
+
+Structure (why it is fast): the Python-level API of tree-sitter creates one object per node it touches, so walking a
+whole tree costs more than parsing it. Instead, native *queries* find the few candidate nodes (definition nodes, or
+identifiers whose text is one of the wanted names), and only those are decoded. A :class:`ParsedFile` parses once and
+shares the line table between definitions, references and imports.
 """
 
 from __future__ import annotations
@@ -12,10 +17,10 @@ from __future__ import annotations
 import bisect
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import PurePosixPath
-from typing import Any, Iterator
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +32,18 @@ _LANGUAGE_BY_SUFFIX = {
     ".java": "java",
 }
 SOURCE_SUFFIXES = frozenset(_LANGUAGE_BY_SUFFIX)
+LANGUAGES = ("python", "javascript", "typescript", "tsx", "java")
 
 _CONTAINER_KINDS = {"class", "interface", "enum"}
+_NAME_RE = re.compile(r"^[^\W\d][\w$]*$|^\$[\w$]*$")  # identifiers only (JS allows a leading "$"); nothing else reaches a query
 
 
 def language_for(path: str) -> str | None:
     return _LANGUAGE_BY_SUFFIX.get(PurePosixPath(path.replace("\\", "/")).suffix.lower())
+
+
+def family(language: str) -> str:
+    return "js" if language in {"javascript", "typescript", "tsx"} else language
 
 
 @lru_cache(maxsize=None)
@@ -63,7 +74,7 @@ def _language(name: str) -> Any:
 
 
 def available_languages() -> set[str]:
-    return {name for name in ("python", "javascript", "typescript", "tsx", "java") if _language(name) is not None}
+    return {name for name in LANGUAGES if _language(name) is not None}
 
 
 def parse(source: bytes, language: str) -> Any:
@@ -74,7 +85,8 @@ def parse(source: bytes, language: str) -> Any:
     try:
         from tree_sitter import Parser
 
-        return Parser(grammar).parse(source)  # a Parser is not thread-safe, so build one per call
+        # A Parser is not thread-safe; measured: building one per call costs nothing next to parsing.
+        return Parser(grammar).parse(source)
     except Exception as error:
         logger.warning("tree-sitter parse failed (%s).", type(error).__name__)
         return None
@@ -95,6 +107,19 @@ class Reference:
     name: str
     line: int
     kind: str  # call | import | type | attr | ref
+    enclosing: Definition | None = field(default=None, compare=False)  # innermost definition containing the use
+
+
+@dataclass(frozen=True)
+class ImportRef:
+    """One import / re-export / require, reduced to what is needed to tell whether a file depends on a module."""
+
+    spec: str  # python: dotted module ("" for "from . import x"); js/ts: module specifier; java: qualified name
+    names: tuple[str, ...] = ()  # python: imported names ("*" for a wildcard)
+    level: int = 0  # python: number of leading dots of a relative import
+    wildcard: bool = False  # java: "import a.b.*"
+    static: bool = False  # java: "import static a.b.C.m"
+    line: int = 0
 
 
 def _text(node: Any) -> str:
@@ -119,15 +144,105 @@ class _Lines:
         return bisect.bisect_right(self._starts, max(node.start_byte, node.end_byte - 1))
 
 
-def _walk(root: Any) -> Iterator[Any]:
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        yield node
-        stack.extend(reversed(node.children))
+# --------------------------------------------------------------------------- query construction ---
+# Node types that can define a symbol, per language family. A value is an extra constraint inside the pattern.
+_DEF_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "python": (("function_definition", ""), ("class_definition", "")),
+    "java": tuple(
+        (kind, "")
+        for kind in (
+            "method_declaration", "constructor_declaration", "class_declaration", "interface_declaration",
+            "enum_declaration", "record_declaration", "annotation_type_declaration",
+        )
+    ),
+    "js": (
+        ("function_declaration", ""), ("generator_function_declaration", ""), ("method_definition", ""),
+        ("class_declaration", ""), ("abstract_class_declaration", ""), ("interface_declaration", ""),
+        ("type_alias_declaration", ""), ("enum_declaration", ""),
+        # `const f = () => ...` and class fields holding functions are definitions too, other declarators are not
+        ("variable_declarator", "value: [(arrow_function) (function_expression)]"),
+        ("public_field_definition", "value: [(arrow_function) (function_expression)]"),
+    ),
+}
+_CONTAINER_TYPES = {
+    "python": {"class_definition"},
+    "java": {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "annotation_type_declaration"},
+    "js": {"class_declaration", "abstract_class_declaration", "interface_declaration", "enum_declaration"},
+}
+_IDENTIFIER_TYPES = {
+    "python": ("identifier",),
+    "java": ("identifier", "type_identifier"),
+    "js": ("identifier", "property_identifier", "type_identifier", "shorthand_property_identifier"),
+}
+_IMPORT_PATTERNS = {
+    "python": "[(import_statement) (import_from_statement)] @imp",
+    "java": "(import_declaration) @imp",
+    "js": (
+        "[(import_statement) (export_statement source: (_))] @imp\n"
+        '(call_expression function: (identifier) @fn arguments: (arguments . (string) @arg) (#eq? @fn "require"))'
+    ),
+}
+# Fields that name the symbol for node types where the name is not an arbitrary node
+_NAME_NODE = {"variable_declarator": "(identifier)", "public_field_definition": "(property_identifier)"}
 
 
-# --------------------------------------------------------------------------- definitions ---
+def _has_kind(grammar: Any, kind: str) -> bool:
+    return grammar.id_for_node_kind(kind, True) is not None
+
+
+def _quote(names: Iterable[str]) -> str:
+    return " ".join(f'"{name}"' for name in sorted(names))
+
+
+def clean_names(names: Iterable[str]) -> frozenset[str]:
+    """Only plain identifiers may be embedded in a query."""
+    return frozenset(name for name in names if isinstance(name, str) and _NAME_RE.match(name))
+
+
+@lru_cache(maxsize=256)
+def _definition_query(language: str, names: frozenset[str] | None) -> Any:
+    grammar = _language(language)
+    if grammar is None or (names is not None and not names):
+        return None
+    from tree_sitter import Query
+
+    predicate = "" if names is None else f"(#any-of? @name {_quote(names)})"
+    patterns = []
+    for kind, constraint in _DEF_PATTERNS[family(language)]:
+        if _has_kind(grammar, kind):
+            name_node = _NAME_NODE.get(kind, "(_)")
+            patterns.append(f"({kind} name: {name_node} @name {constraint} {predicate}) @def")
+    return Query(grammar, "\n".join(patterns)) if patterns else None
+
+
+@lru_cache(maxsize=256)
+def _reference_query(language: str, names: frozenset[str]) -> Any:
+    grammar = _language(language)
+    if grammar is None or not names:
+        return None
+    from tree_sitter import Query
+
+    kinds = " ".join(f"({kind})" for kind in _IDENTIFIER_TYPES[family(language)] if _has_kind(grammar, kind))
+    return Query(grammar, f"([{kinds}] @id (#any-of? @id {_quote(names)}))")
+
+
+@lru_cache(maxsize=16)
+def _import_query(language: str) -> Any:
+    grammar = _language(language)
+    if grammar is None:
+        return None
+    from tree_sitter import Query
+
+    return Query(grammar, _IMPORT_PATTERNS[family(language)])
+
+
+def _captures(query: Any, node: Any) -> dict[str, list[Any]]:
+    from tree_sitter import QueryCursor
+
+    return QueryCursor(query).captures(node)
+
+
+# --------------------------------------------------------------------------- decoding ---
 def _definition_parts(node: Any, language: str, container: str) -> tuple[str, str, Any] | None:
     """Return (name, kind, body_node) when this node defines a named symbol."""
     kind_by_type: dict[str, str]
@@ -179,54 +294,6 @@ def _signature_end(node: Any, body: Any, language: str, lines: _Lines) -> int:
     return max(start, body_line - 1) if language == "python" else max(start, body_line)
 
 
-def extract_definitions(source: bytes, language: str, tree: Any = None) -> list[Definition]:
-    tree = tree or parse(source, language)
-    if tree is None:
-        return []
-    lines = _Lines(source)
-    definitions: list[Definition] = []
-    stack: list[tuple[Any, str]] = [(tree.root_node, "")]
-    while stack:
-        node, container = stack.pop()
-        parts = _definition_parts(node, language, container)
-        next_container = container
-        if parts is not None:
-            name, kind, body = parts
-            definitions.append(
-                Definition(
-                    name=name,
-                    kind=kind,
-                    start_line=lines.start(node),
-                    end_line=lines.end(node),
-                    signature_end_line=_signature_end(node, body, language, lines),
-                    container=container,
-                )
-            )
-            if kind in _CONTAINER_KINDS:
-                next_container = name
-        for child in reversed(node.children):
-            stack.append((child, next_container))
-    return sorted(definitions, key=lambda item: (item.start_line, item.end_line))
-
-
-def enclosing_definition(definitions: list[Definition], line: int) -> Definition | None:
-    """Smallest definition whose line range contains the line."""
-    best: Definition | None = None
-    for definition in definitions:
-        if definition.start_line <= line <= definition.end_line:
-            if best is None or (definition.end_line - definition.start_line) <= (best.end_line - best.start_line):
-                best = definition
-    return best
-
-
-# --------------------------------------------------------------------------- references ---
-_IDENTIFIER_TYPES = {
-    "python": {"identifier"},
-    "java": {"identifier", "type_identifier"},
-    "javascript": {"identifier", "property_identifier", "type_identifier", "shorthand_property_identifier"},
-    "typescript": {"identifier", "property_identifier", "type_identifier", "shorthand_property_identifier"},
-    "tsx": {"identifier", "property_identifier", "type_identifier", "shorthand_property_identifier"},
-}
 _JS_DECLARATIONS = {
     "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration",
     "method_definition", "variable_declarator", "public_field_definition", "property_signature", "method_signature",
@@ -315,23 +382,182 @@ def _classify(node: Any, language: str) -> str | None:
     return "type" if node.type == "type_identifier" else "ref"
 
 
+def _unquote(text: str) -> str:
+    text = text.strip()
+    return text[1:-1] if len(text) >= 2 and text[0] in "'\"`" and text[-1] == text[0] else text
+
+
+_JAVA_IMPORT = re.compile(r"^\s*import\s+(static\s+)?([\w$.]+?)(\.\*)?\s*;", re.DOTALL)
+
+
+# --------------------------------------------------------------------------- one parsed file ---
+class ParsedFile:
+    """A source file parsed once. Definitions, references and imports are extracted on demand from the same tree."""
+
+    __slots__ = ("source", "language", "tree", "_lines")
+
+    def __init__(self, source: bytes, language: str, tree: Any) -> None:
+        self.source, self.language, self.tree = source, language, tree
+        self._lines: _Lines | None = None
+
+    @classmethod
+    def open(cls, source: bytes, language: str, tree: Any = None) -> "ParsedFile | None":
+        tree = tree or parse(source, language)
+        return None if tree is None else cls(source, language, tree)
+
+    @property
+    def lines(self) -> _Lines:
+        if self._lines is None:
+            self._lines = _Lines(self.source)
+        return self._lines
+
+    # ---- definitions ----
+    def _container_name(self, node: Any) -> str:
+        types = _CONTAINER_TYPES[family(self.language)]
+        parent = node.parent
+        while parent is not None:
+            if parent.type in types:
+                name = _text(parent.child_by_field_name("name"))
+                if name:
+                    return name
+            parent = parent.parent
+        return ""
+
+    def _make_definition(self, node: Any, container: str) -> Definition | None:
+        parts = _definition_parts(node, self.language, container)
+        if parts is None:
+            return None
+        name, kind, body = parts
+        lines = self.lines
+        return Definition(
+            name=name,
+            kind=kind,
+            start_line=lines.start(node),
+            end_line=lines.end(node),
+            signature_end_line=_signature_end(node, body, self.language, lines),
+            container=container,
+        )
+
+    def definitions(self, names: Iterable[str] | None = None) -> list[Definition]:
+        """Every definition in the file, or only those whose name is in ``names`` (a much cheaper query)."""
+        wanted = None if names is None else clean_names(names)
+        query = _definition_query(self.language, wanted)
+        if query is None:
+            return []
+        seen: dict[tuple[int, int], Any] = {}
+        for node in _captures(query, self.tree.root_node).get("def", []):
+            seen.setdefault((node.start_byte, node.end_byte), node)
+        ordered = sorted(seen.values(), key=lambda node: (node.start_byte, -node.end_byte))
+        found: list[Definition] = []
+        if wanted is not None:
+            # Only a few nodes were selected, so the enclosing container is looked up per node.
+            for node in ordered:
+                definition = self._make_definition(node, self._container_name(node))
+                if definition is not None:
+                    found.append(definition)
+            return sorted(found, key=lambda item: (item.start_line, item.end_line))
+        # All definitions are present: containers are tracked with a stack over the containment order.
+        stack: list[tuple[int, str]] = []  # (end_byte, container name)
+        for node in ordered:
+            while stack and stack[-1][0] <= node.start_byte:
+                stack.pop()
+            definition = self._make_definition(node, stack[-1][1] if stack else "")
+            if definition is None:
+                continue
+            found.append(definition)
+            if definition.kind in _CONTAINER_KINDS:
+                stack.append((node.end_byte, definition.name))
+        return sorted(found, key=lambda item: (item.start_line, item.end_line))
+
+    def enclosing(self, node: Any) -> Definition | None:
+        """The innermost definition that contains ``node`` (found by climbing the tree, no full extraction)."""
+        types = {kind for kind, _ in _DEF_PATTERNS[family(self.language)]}
+        parent = node.parent
+        while parent is not None:
+            if parent.type in types:
+                definition = self._make_definition(parent, self._container_name(parent))
+                if definition is not None:
+                    return definition
+            parent = parent.parent
+        return None
+
+    # ---- references ----
+    def references(self, names: Iterable[str], with_enclosing: bool = False) -> list[Reference]:
+        """Uses of the given names (definitions, parameters and keyword names are not uses)."""
+        query = _reference_query(self.language, clean_names(names))
+        if query is None:
+            return []
+        lines = self.lines
+        found: list[Reference] = []
+        for node in _captures(query, self.tree.root_node).get("id", []):
+            kind = _classify(node, self.language)
+            if kind is not None:
+                found.append(
+                    Reference(name=_text(node), line=lines.start(node), kind=kind, enclosing=self.enclosing(node) if with_enclosing else None)
+                )
+        found.sort(key=lambda ref: (ref.line, ref.name, ref.kind))  # a total order: results must be reproducible
+        return found
+
+    # ---- imports ----
+    def imports(self) -> list[ImportRef]:
+        query = _import_query(self.language)
+        if query is None:
+            return []
+        captures = _captures(query, self.tree.root_node)
+        fam = family(self.language)
+        lines = self.lines
+        found: list[ImportRef] = []
+        if fam == "python":
+            for node in captures.get("imp", []):
+                found.extend(self._python_import(node, lines.start(node)))
+        elif fam == "java":
+            for node in captures.get("imp", []):
+                match = _JAVA_IMPORT.match(_text(node))
+                if match:
+                    found.append(ImportRef(spec=match.group(2), wildcard=bool(match.group(3)), static=bool(match.group(1)), line=lines.start(node)))
+        else:
+            for node in captures.get("imp", []):
+                source = node.child_by_field_name("source")
+                if source is not None:
+                    found.append(ImportRef(spec=_unquote(_text(source)), line=lines.start(node)))
+            for node in captures.get("arg", []):
+                found.append(ImportRef(spec=_unquote(_text(node)), line=lines.start(node)))
+        return found
+
+    @staticmethod
+    def _python_import(node: Any, line: int) -> list[ImportRef]:
+        def module_of(child: Any) -> str:
+            target = child.child_by_field_name("name") if child.type == "aliased_import" else child
+            return _text(target)
+
+        if node.type == "import_statement":
+            return [ImportRef(spec=module_of(child), line=line) for child in node.children_by_field_name("name")]
+        module = node.child_by_field_name("module_name")
+        text = _text(module)
+        level = len(text) - len(text.lstrip("."))
+        names = tuple(module_of(child) for child in node.children_by_field_name("name"))
+        if any(child.type == "wildcard_import" for child in node.children):
+            names += ("*",)
+        return [ImportRef(spec=text.lstrip("."), names=names, level=level, line=line)]
+
+
+# --------------------------------------------------------------------------- convenience wrappers ---
+def extract_definitions(source: bytes, language: str, tree: Any = None) -> list[Definition]:
+    parsed = ParsedFile.open(source, language, tree)
+    return parsed.definitions() if parsed else []
+
+
 def find_references(source: bytes, language: str, names: set[str], tree: Any = None) -> list[Reference]:
     """All identifiers in the file whose text is one of ``names`` and that are uses (not definitions/parameters)."""
-    if not names:
-        return []
-    tree = tree or parse(source, language)
-    if tree is None:
-        return []
-    identifier_types = _IDENTIFIER_TYPES.get(language, set())
-    lines = _Lines(source)
-    references: list[Reference] = []
-    for node in _walk(tree.root_node):
-        if node.type not in identifier_types:
-            continue
-        name = _text(node)
-        if name not in names:
-            continue
-        kind = _classify(node, language)
-        if kind is not None:
-            references.append(Reference(name=name, line=lines.start(node), kind=kind))
-    return references
+    parsed = ParsedFile.open(source, language, tree)
+    return parsed.references(names) if parsed else []
+
+
+def enclosing_definition(definitions: list[Definition], line: int) -> Definition | None:
+    """Smallest definition whose line range contains the line."""
+    best: Definition | None = None
+    for definition in definitions:
+        if definition.start_line <= line <= definition.end_line:
+            if best is None or (definition.end_line - definition.start_line) <= (best.end_line - best.start_line):
+                best = definition
+    return best

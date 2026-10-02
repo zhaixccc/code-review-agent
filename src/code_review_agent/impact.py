@@ -24,15 +24,17 @@ from typing import Any
 from .code_index import (
     SOURCE_SUFFIXES,
     Definition,
-    enclosing_definition,
+    ImportRef,
+    ParsedFile,
     extract_definitions,
-    find_references,
+    family,
     language_for,
     parse,
 )
 from .config import Settings
 from .diff_utils import changed_new_lines
 from .models import ChangedFile
+from .module_links import imports_link, same_java_package
 from .prioritize import is_test_path
 from .secrets_guard import is_sensitive_path, redact
 
@@ -102,6 +104,18 @@ class Caller:
     in_changed_file: bool
     is_test: bool
     sites: int = 1
+    # imports  : this file imports the changed file (the strongest sign that the use is the changed symbol)
+    # package  : Java, same package (no import needed)
+    # shadowed : this file defines its own symbol with the same name and does not import the changed file,
+    #            so the use most likely refers to that other symbol
+    # elsewhere: this file imports (or, in Java, shares a package with) a DIFFERENT file that defines a symbol of this
+    #            name, and does not import the changed file
+    # unknown  : no evidence either way
+    link: str = "unknown"
+
+    @property
+    def unrelated(self) -> bool:
+        return self.link in {"shadowed", "elsewhere"}
 
 
 @dataclass
@@ -110,6 +124,7 @@ class SymbolImpact:
     callers: list[Caller] = field(default_factory=list)
     total_callers: int = 0
     unmodified_callers: int = 0
+    likely_unrelated: int = 0
     test_files: list[str] = field(default_factory=list)
     other_definitions: int = 0
 
@@ -127,6 +142,15 @@ class _Hit:
     line: int
     kind: str
     enclosing: Definition | None
+
+
+@dataclass
+class _FileFacts:
+    """What the scan learned about one file that mentions a searched name."""
+
+    language: str
+    imports: list[ImportRef]
+    defined: set[str]  # searched names this file itself defines
 
 
 def _safe_read(root: Path, relative: str) -> bytes | None:
@@ -218,12 +242,23 @@ def _iter_source_files(root: Path, limit: int) -> list[Path]:
     return sorted(files)
 
 
+def _word_pattern(names: set[str]) -> re.Pattern[bytes]:
+    """Whole-word matcher over raw bytes. ``render`` must not select a file that only has ``render_to_string``.
+
+    Identifiers never contain ASCII non-word bytes other than ``$``, so the look-arounds cannot hide a real use.
+    """
+    alternation = b"|".join(re.escape(name.encode("utf-8")) for name in sorted(names, key=len, reverse=True))
+    return re.compile(rb"(?<![\w$])(?:" + alternation + rb")(?![\w$])")
+
+
 def _scan(
     root: Path, names: set[str], *, max_scan: int, max_parse: int, deadline: float
-) -> tuple[dict[str, list[_Hit]], dict[str, list[tuple[str, Definition]]], bool, int]:
-    wanted = {name: name.encode("utf-8") for name in names}
+) -> tuple[dict[str, list[_Hit]], dict[str, list[tuple[str, Definition]]], dict[str, _FileFacts], bool, int]:
+    needles = [name.encode("utf-8") for name in names]
+    word = _word_pattern(names)
     hits: dict[str, list[_Hit]] = defaultdict(list)
     definitions_found: dict[str, list[tuple[str, Definition]]] = defaultdict(list)
+    facts: dict[str, _FileFacts] = {}
     parsed = 0
     incomplete = False
     for path in _iter_source_files(root, max_scan):
@@ -234,27 +269,60 @@ def _scan(
             data = path.read_bytes()
         except OSError:
             continue
-        present = {name for name, needle in wanted.items() if needle in data}
+        # Two stages: a plain substring test is nearly free; the whole-word regex only runs on the survivors.
+        if not any(needle in data for needle in needles):
+            continue
+        present = {match.decode("utf-8", "replace") for match in word.findall(data)}
         if not present:
             continue
         language = language_for(path.name)
-        tree = parse(data, language) if language else None
-        if tree is None:
+        file = ParsedFile.open(data, language) if language else None
+        if file is None:
             continue
         parsed += 1
         relative = path.relative_to(root).as_posix()
-        definitions = extract_definitions(data, language, tree)
-        for definition in definitions:
-            if definition.name in present:
-                definitions_found[definition.name].append((relative, definition))
-        for reference in find_references(data, language, present, tree):
-            hits[reference.name].append(
-                _Hit(relative, reference.line, reference.kind, enclosing_definition(definitions, reference.line))
-            )
-    return hits, definitions_found, incomplete, parsed
+        defined: set[str] = set()
+        for definition in file.definitions(present):  # a name-filtered query: cheap, no full extraction
+            definitions_found[definition.name].append((relative, definition))
+            defined.add(definition.name)
+        found = file.references(present, with_enclosing=True)
+        for reference in found:
+            hits[reference.name].append(_Hit(relative, reference.line, reference.kind, reference.enclosing))
+        if found:
+            facts[relative] = _FileFacts(language, file.imports(), defined)
+    return hits, definitions_found, facts, incomplete, parsed
 
 
-def _callers(symbol: ChangedSymbol, hits: dict[str, list[_Hit]], changed_paths: set[str]) -> list[Caller]:
+def _link(symbol: ChangedSymbol, path: str, facts: _FileFacts | None, other_definers: set[str]) -> str:
+    """How strongly does this file's use of the name point at the changed symbol? (see ``Caller.link``)"""
+    if facts is None or path == symbol.path:
+        return "unknown"
+    if imports_link(path, facts.imports, symbol.path, facts.language):
+        return "imports"
+    java = family(facts.language) == "java"
+    if java and same_java_package(path, symbol.path):
+        return "package"
+    if facts.defined & set(symbol.search_names):
+        return "shadowed"
+    for other in other_definers:
+        if imports_link(path, facts.imports, other, facts.language) or (java and same_java_package(path, other)):
+            return "elsewhere"
+    return "unknown"
+
+
+_LINK_ORDER = {"imports": 0, "package": 0, "unknown": 1, "shadowed": 2, "elsewhere": 2}
+
+
+def _callers(
+    symbol: ChangedSymbol,
+    hits: dict[str, list[_Hit]],
+    changed_paths: set[str],
+    facts: dict[str, _FileFacts],
+    definers: dict[str, list[tuple[str, Definition]]],
+) -> list[Caller]:
+    other_definers = {
+        path for name in symbol.search_names for path, _ in definers.get(name, []) if path != symbol.path
+    }
     groups: dict[tuple[str, int], Caller] = {}
     for name in symbol.search_names:
         for hit in hits.get(name, []):
@@ -263,7 +331,10 @@ def _callers(symbol: ChangedSymbol, hits: dict[str, list[_Hit]], changed_paths: 
             key = (hit.path, hit.enclosing.start_line if hit.enclosing else hit.line)
             existing = groups.get(key)
             if existing is None:
-                groups[key] = Caller(hit.path, hit.line, hit.kind, hit.enclosing, hit.path in changed_paths, is_test_path(hit.path))
+                groups[key] = Caller(
+                    hit.path, hit.line, hit.kind, hit.enclosing, hit.path in changed_paths, is_test_path(hit.path),
+                    link=_link(symbol, hit.path, facts.get(hit.path), other_definers),
+                )
             else:
                 existing.sites += 1
                 if _KIND_WEIGHT.get(hit.kind, 0) > _KIND_WEIGHT.get(existing.kind, 0):
@@ -275,7 +346,7 @@ def _callers(symbol: ChangedSymbol, hits: dict[str, list[_Hit]], changed_paths: 
 
 def _rank(symbol: ChangedSymbol, caller: Caller) -> tuple[Any, ...]:
     same_dir = Path(caller.path).parent == Path(symbol.path).parent
-    return (caller.in_changed_file, -_KIND_WEIGHT.get(caller.kind, 0), not same_dir, caller.path, caller.line)
+    return (_LINK_ORDER.get(caller.link, 1), caller.in_changed_file, -_KIND_WEIGHT.get(caller.kind, 0), not same_dir, caller.path, caller.line)
 
 
 def _snippet(root: Path, cache: dict[str, list[str]], caller: Caller) -> str:
@@ -312,21 +383,36 @@ def _render_symbol(root: Path, cache: dict[str, list[str]], index: int, impact: 
     names = "" if symbol.search_names == (symbol.name,) else f" (referenced as {', '.join(symbol.search_names)})"
     out = [f"[{index}] {symbol.name} ({symbol.kind}) at {where}{names}: {label}"]
     if impact.other_definitions:
-        out.append(f"    note: {impact.other_definitions} other definition(s) with the same name exist in the repository; some matches below may be unrelated.")
+        out.append(
+            f"    note: {impact.other_definitions} other definition(s) with the same name exist in the repository. "
+            "Each caller below is tagged: 'imports the changed file' is strong evidence; 'defines its own symbol with the "
+            "same name' most likely calls something else."
+        )
+    shown = [c for c in impact.callers if not c.unrelated][:max_callers]  # unrelated ones are counted, never shown
+    unrelated = f"; {impact.likely_unrelated} more call a different same-named symbol (not shown)" if impact.likely_unrelated else ""
     out.append(
-        f"    callers/users found: {impact.total_callers} (showing {min(len(impact.callers), max_callers)}); "
-        f"{impact.unmodified_callers} in files NOT modified by this change"
+        f"    callers/users found: {impact.total_callers} (showing {len(shown)}); "
+        f"{impact.unmodified_callers} in files NOT modified by this change{unrelated}"
     )
-    for caller in impact.callers[:max_callers]:
+    for caller in shown:
         where_called = f"in {caller.enclosing.name}()" if caller.enclosing else "at module level"
         state = "file also modified in this change" if caller.in_changed_file else "file NOT modified in this change"
         sites = f", {caller.sites} sites" if caller.sites > 1 else ""
-        out.append(f"    - {caller.path}:{caller.line} {where_called} [{caller.kind}{sites}; {state}]")
+        tag = _LINK_TEXT.get(caller.link, "")
+        out.append(f"    - {caller.path}:{caller.line} {where_called} [{caller.kind}{sites}; {state}{tag}]")
         snippet = _snippet(root, cache, caller)
         if snippet:
             out.extend("        " + row for row in snippet.splitlines())
     out.append("    tests referencing it: " + (", ".join(impact.test_files) if impact.test_files else "none found"))
     return "\n".join(out)
+
+
+_LINK_TEXT = {
+    "imports": "; imports the changed file",
+    "package": "; same package as the changed file",
+    "shadowed": "; defines its own symbol with the same name and does not import the changed file: likely unrelated",
+    "elsewhere": "; imports a DIFFERENT file that defines a symbol with this name: likely unrelated",
+}
 
 
 def _summary_line(impact: SymbolImpact) -> str | None:
@@ -373,7 +459,7 @@ def analyze_impact(root: Path, files: list[ChangedFile], changed_paths: set[str]
     report = ImpactReport(stats={"symbols": sum(len(s) for s in per_file.values()), "names": len(names)})
     if not names:
         return report
-    hits, definitions_found, incomplete, parsed = _scan(
+    hits, definitions_found, facts, incomplete, parsed = _scan(
         root, names, max_scan=settings.impact_max_scan_files, max_parse=settings.impact_max_parse_files, deadline=deadline
     )
     report.stats.update({"files_parsed": parsed, "incomplete": incomplete})
@@ -382,7 +468,7 @@ def analyze_impact(root: Path, files: list[ChangedFile], changed_paths: set[str]
         sections: list[str] = []
         budget = settings.impact_evidence_chars
         for symbol in symbols:
-            callers = _callers(symbol, hits, changed_paths)
+            callers = _callers(symbol, hits, changed_paths, facts, definitions_found)
             non_tests = sorted((c for c in callers if not c.is_test), key=lambda c: _rank(symbol, c))
             test_files = sorted({c.path for c in callers if c.is_test})[:3]
             others = sum(
@@ -391,16 +477,18 @@ def analyze_impact(root: Path, files: list[ChangedFile], changed_paths: set[str]
                 for path, definition in definitions_found.get(name, [])
                 if not (path == symbol.path and definition.start_line == symbol.start_line)
             )
+            related = [c for c in non_tests if not c.unrelated]
             impact = SymbolImpact(
                 symbol=symbol,
                 callers=non_tests,
-                total_callers=len(non_tests),
-                unmodified_callers=sum(1 for c in non_tests if not c.in_changed_file),
+                total_callers=len(related),
+                unmodified_callers=sum(1 for c in related if not c.in_changed_file),
+                likely_unrelated=len(non_tests) - len(related),
                 test_files=test_files,
                 other_definitions=others,
             )
-            if not non_tests:
-                continue  # nobody else depends on it (as far as name matching can tell): nothing to verify
+            if not related:
+                continue  # no caller points at this symbol (all are unrelated or absent): nothing worth showing a model
             if symbol.change == "body" and not impact.unmodified_callers:
                 continue  # a body-only edit with no outside users is already fully visible in the diff
             max_callers = settings.impact_max_callers if symbol.change != "body" else 2

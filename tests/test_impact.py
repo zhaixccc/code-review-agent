@@ -204,3 +204,113 @@ def test_a_fully_rewritten_function_that_keeps_its_name_is_still_analysed(tmp_pa
     )
     patch = "@@ -1,2 +1,2 @@\n-def compute(a):\n-    return a\n+def compute(a, b):\n+    return b\n"
     assert "SIGNATURE/HEADER CHANGED" in analyze_impact(root, [changed("lib.py", patch)], {"lib.py"}, SETTINGS).by_file["lib.py"]
+
+
+# ------------------------------------------------------------------- disambiguating same-named symbols ---
+RENDER_PATCH = "@@ -1,2 +1,2 @@\n-def render(request):\n+def render(request, context):\n     return request\n"
+
+
+def render_repo(tmp_path: Path) -> Path:
+    return write(
+        tmp_path,
+        {
+            "web/shortcuts.py": "def render(request, context):\n    return request\n",
+            "web/views.py": "from web.shortcuts import render\n\n\ndef home(request):\n    return render(request)\n",
+            "admin/widgets.py": "class Widget:\n    def render(self):\n        return 1\n\n    def show(self):\n        return self.render()\n",
+            "admin/mixins.py": "def render():\n    return 2\n\n\ndef page():\n    return render()\n",
+            "misc/other.py": "def helper():\n    return render_to_string()\n",  # only a substring of the name
+        },
+    )
+
+
+def test_callers_are_tiered_by_import_evidence(tmp_path):
+    root = render_repo(tmp_path)
+    text = analyze_impact(root, [changed("web/shortcuts.py", RENDER_PATCH)], {"web/shortcuts.py"}, SETTINGS)
+    evidence = text.by_file["web/shortcuts.py"]
+    assert "web/views.py:5 in home()" in evidence and "imports the changed file" in evidence
+    assert "2 more call a different same-named symbol (not shown)" in evidence
+    assert "admin/" not in evidence  # callers of other same-named symbols are counted, never shown to the model
+    assert "misc/other.py" not in evidence  # `render_to_string` is not `render`
+
+
+def test_unrelated_callers_do_not_inflate_the_headline_numbers(tmp_path):
+    root = render_repo(tmp_path)
+    report = analyze_impact(root, [changed("web/shortcuts.py", RENDER_PATCH)], {"web/shortcuts.py"}, SETTINGS)
+    evidence = report.by_file["web/shortcuts.py"]
+    assert "callers/users found: 1 " in evidence and "not shown" in evidence
+    assert "涉及 1 处调用方" in report.summary[0]  # one real caller, not three
+
+
+def test_an_unrelated_only_symbol_produces_no_headline(tmp_path):
+    root = write(
+        tmp_path,
+        {
+            "lib/pricing.py": "def apply_discount(price, rate, currency):\n    return price\n",
+            "loyalty/points.py": "def apply_discount(points):\n    return points\n\n\ndef redeem(points):\n    return apply_discount(points)\n",
+        },
+    )
+    patch = "@@ -1,2 +1,2 @@\n-def apply_discount(price, rate):\n+def apply_discount(price, rate, currency):\n     return price\n"
+    report = analyze_impact(root, [changed("lib/pricing.py", patch)], {"lib/pricing.py"}, SETTINGS)
+    assert report.summary == []  # the only "caller" calls its own function
+
+
+def test_java_same_package_counts_as_linked_without_an_import(tmp_path):
+    root = write(
+        tmp_path,
+        {
+            "src/com/x/Util.java": "package com.x;\npublic class Util {\n    public static int help(int a, int b) { return a; }\n}\n",
+            "src/com/x/Main.java": "package com.x;\npublic class Main {\n    int run() { return Util.help(1); }\n}\n",
+            "src/com/y/Other.java": "package com.y;\npublic class Other {\n    int help(int a) { return a; }\n    int go() { return help(1); }\n}\n",
+        },
+    )
+    patch = "@@ -3,1 +3,1 @@\n-    public static int help(int a) { return a; }\n+    public static int help(int a, int b) { return a; }\n"
+    evidence = analyze_impact(root, [changed("src/com/x/Util.java", patch)], {"src/com/x/Util.java"}, SETTINGS).by_file["src/com/x/Util.java"]
+    assert "same package as the changed file" in evidence and "src/com/x/Main.java" in evidence
+
+
+def test_a_caller_that_imports_a_different_same_named_function_is_unrelated(tmp_path):
+    # the exact shape of the evaluation case that fooled the model: no local definition, but an import of ANOTHER one
+    root = write(
+        tmp_path,
+        {
+            "billing/pricing.py": "def apply_discount(price, rate, currency):\n    return price\n",
+            "orders/checkout.py": "from billing.pricing import apply_discount\n\n\ndef checkout(t):\n    return apply_discount(t, 0.1, 'USD')\n",
+            "loyalty/points.py": "def apply_discount(points):\n    return points\n",
+            "loyalty/report.py": "from loyalty.points import apply_discount\n\n\ndef report(p):\n    return apply_discount(p)\n",
+        },
+    )
+    patch = "@@ -1,2 +1,2 @@\n-def apply_discount(price, rate):\n+def apply_discount(price, rate, currency):\n     return price\n"
+    report = analyze_impact(root, [changed("billing/pricing.py", patch)], {"billing/pricing.py", "orders/checkout.py"}, SETTINGS)
+    assert report.summary == []  # the only unmodified user imports the other function; checkout is updated in this change
+    evidence = report.by_file.get("billing/pricing.py", "")
+    assert "loyalty/report.py" not in evidence  # it calls the OTHER function: counted, never shown
+
+
+def test_the_import_that_points_here_still_wins_when_both_are_imported(tmp_path):
+    root = write(
+        tmp_path,
+        {
+            "billing/pricing.py": "def apply_discount(price, rate, currency):\n    return price\n",
+            "loyalty/points.py": "def apply_discount(points):\n    return points\n",
+            "both.py": "from billing.pricing import apply_discount as money\nfrom loyalty.points import apply_discount\n\n\ndef go():\n    return money(1, 2)\n",
+        },
+    )
+    patch = "@@ -1,2 +1,2 @@\n-def apply_discount(price, rate):\n+def apply_discount(price, rate, currency):\n     return price\n"
+    evidence = analyze_impact(root, [changed("billing/pricing.py", patch)], {"billing/pricing.py"}, SETTINGS).by_file["billing/pricing.py"]
+    assert "both.py" in evidence and "imports the changed file" in evidence
+
+
+def test_typescript_import_of_another_same_named_function_is_unrelated(tmp_path):
+    root = write(
+        tmp_path,
+        {
+            "src/money/format.ts": "export function formatPrice(a: number, locale: string): string {\n  return String(a);\n}\n",
+            "src/money/cart.ts": "import { formatPrice } from './format';\nexport const t = (n: number) => formatPrice(n, 'en');\n",
+            "src/points/format.ts": "export function formatPrice(p: number): string {\n  return String(p);\n}\n",
+            "src/points/badge.ts": "import { formatPrice } from './format';\nexport const b = (p: number) => formatPrice(p);\n",
+        },
+    )
+    patch = "@@ -1,3 +1,3 @@\n-export function formatPrice(a: number): string {\n+export function formatPrice(a: number, locale: string): string {\n   return String(a);\n }\n"
+    report = analyze_impact(root, [changed("src/money/format.ts", patch)], {"src/money/format.ts", "src/money/cart.ts"}, SETTINGS)
+    assert report.summary == []
+    assert "src/points/badge.ts" not in report.by_file.get("src/money/format.ts", "")
