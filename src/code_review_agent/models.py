@@ -28,6 +28,8 @@ class Finding(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     detail: str = Field(min_length=1, max_length=2000)
     suggestion: Optional[str] = Field(default=None, max_length=2000)
+    # "rule" = produced by deterministic code (secret scan, sensitive file); never produced or overridden by the model.
+    origin: Literal["model", "rule"] = "model"
 
     @field_validator("severity", "category", mode="before")
     @classmethod

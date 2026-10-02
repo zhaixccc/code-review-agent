@@ -7,18 +7,20 @@
 ```
 GitHub webhook ──► 验证签名 / 过滤事件 ──► LangGraph
                                             │
- fetch_changes ─► triage ─► recall_memory ─┬─► review_file（每个文件并行，DeepSeek）─┐
-                                           └──────────（无可审查文件）──────────────┤
+ fetch_changes ─► triage ─► impact_analysis ─► recall_memory ─┬─► review_file（每个文件并行，DeepSeek）─┐
+                                                            └───（无可审查文件）───────────┤
                                                                                     ▼
-                                                      synthesize ─► publish ─► learn
+                                          verify ─► synthesize ─► publish ─► learn
 ```
 
 | 节点 | 作用 |
 |---|---|
 | `fetch_changes` | 通过 GitHub API 读取 commit / PR 的变更文件（分页取全，最多 `MAX_COMMIT_PAGES` 页）与 diff |
 | `triage` | 跳过删除文件、锁文件、依赖/产物目录、二进制；**按风险排序**（认证、权限、SQL、支付、迁移等路径优先）并在总字符预算内挑选；敏感文件（`.env`、私钥等）不送模型，直接给出确定性告警 |
+| `impact_analysis` | （默认开启）下载被审查提交时的仓库快照，用 tree-sitter 找出 diff 触及的函数/类，再在整个仓库里找它们的**调用方和测试**，把调用方的真实代码片段作为证据交给审查模型。详见下文 |
 | `recall_memory` | （可选）从 Hindsight 召回该仓库的约定与历史反馈，作为不可信背景附加到提示词 |
-| `review_file` | 用 LangGraph `Send` 对每个文件并行调用 DeepSeek；大 diff 分块；送模型前对疑似密钥打码，并对新增行做确定性密钥扫描；输出结构化 findings |
+| `review_file` | 用 LangGraph `Send` 对每个文件并行调用 DeepSeek；大 diff 分块（超长时按 hunk 保留首尾，不只看开头）；送模型前对疑似密钥打码，并对新增行做确定性密钥扫描；输出结构化 findings；相同输入的结果会缓存（`REVIEW_CACHE`） |
+| `verify` | 二次验证：对每条 major/critical 问题，让模型在只看代码证据的前提下尝试**反驳**。被反驳的剔除，无法证实的降一级，验证调用失败则保留原样；规则产生的发现（密钥扫描等）不参与。每条决定都会记录（`--explain` 可查看） |
 | `synthesize` | 合并、去重、排序；**结论由代码根据严重度确定**（不由模型决定）；再让模型写简短总结 |
 | `publish` | push → 提交评论（commit comment，同一提交重复审查时更新而非新增）；PR → 行内评论按已有评论去重 + 一条汇总评论（更新而非新增） |
 | `learn` | （可选）把本次审查沉淀到 Hindsight；`--post` 之外的试跑不写记忆 |
@@ -63,6 +65,37 @@ Copy-Item .env.example .env      # 然后编辑 .env，填入密钥
    - Secret：与 `GITHUB_WEBHOOK_SECRET` 相同
    - 事件：与 `REVIEW_EVENTS` 一致（默认 **Push**；若改为 `pull_request` 选 **Pull requests**）。同时开启两种会对同一改动重复审查。
 
+## 影响面分析（理解整个仓库，而不只是 diff）
+
+只看 diff 回答不了“还会破坏什么”。开启后（默认开启，`IMPACT_ANALYSIS=false` 关闭），每次审查会：
+
+1. 用 GitHub API 下载被审查提交的仓库压缩包（按提交缓存在 `STATE_DIR/snapshots`），只解压源码文件；解压防路径穿越、链接、压缩炸弹，**不执行仓库中的任何代码**。
+2. 用 tree-sitter（Python、JavaScript/TypeScript/TSX、Java）解析被改文件，把 diff 映射到具体的函数/类，判断是**签名/声明变更**、**函数体变更**还是**被移除/改名**；全新的符号不分析（没有“旧调用方”）。
+3. 在整个仓库里按名字找调用方/导入方/相关测试，标注调用方所在文件**是否随本次改动一起修改**。这正是“改了签名却没改调用方”类问题的线索。
+4. 把调用方的代码片段（先脱敏）作为证据交给模型；模型只有在证据显示调用方确实不再兼容时才报告，并必须引用 `path:line`。报告里会多一节“影响面”概述。
+
+限制（请知悉）：
+
+- 匹配是**按名字**的，不做类型解析：同名的无关符号会被误连（证据里会标注仓库中还有几个同名定义）；动态调用、反射、跨仓库依赖找不到。过于通用的方法名（`get`、`run` 等）直接跳过。
+- 只支持上述语言；其他语言的文件照常审查，只是没有影响面证据。
+- 有时间/文件数预算（`IMPACT_TIME_BUDGET_SECONDS`、`IMPACT_MAX_PARSE_FILES`），超出时证据会标注“可能不完整”。
+- **隐私**：仓库源码只会下载到本机分析；发送给 DeepSeek 的只有 diff 和调用方的短代码片段。若不希望仓库其他代码的片段离开本机，请关闭。
+- **进程隔离**：tree-sitter 是原生代码，且解析的是不可信文件，因此分析默认在独立子进程里跑（`IMPACT_ISOLATED`），崩溃或卡死只会让这次审查少一份证据，不会拖垮服务。
+
+## 评测（用数据证明改进有效）
+
+`eval` 命令在内置的「种入缺陷」用例上跑真实的审查流程（只调用 DeepSeek，不访问 GitHub、不发布评论），统计召回和误报：
+
+```powershell
+.\.venv\Scripts\python.exe -m code_review_agent eval --list
+.\.venv\Scripts\python.exe -m code_review_agent eval --runs 2                       # 完整流程
+.\.venv\Scripts\python.exe -m code_review_agent eval --runs 2 --no-impact --no-verify  # 基线，用于对比
+```
+
+用例分三类：`cross_file`（破坏发生在未改动的文件里，必须点名具体调用方才算命中）、`local`（diff 内可见的缺陷）、`clean`（不应报告的改动，包括“签名变了但调用方已同步”“新增带默认值的参数”）。结果保存在 `STATE_DIR/evals/`。用例规模很小，结果只能说明趋势，不是统计显著的基准；请结合自己仓库的真实提交补充用例（用例定义在 `src/code_review_agent/evaluation.py`）。
+
+在 2026-10 的一次实测（deepseek-chat，10 个用例×2 次）中：基线对跨文件缺陷的召回为 0/8（它只能泛泛地说“可能影响调用方”，点不出是哪个），开启影响面分析后为 8/8；二次验证在其中一次运行里剔除了 1 条误报。这是小样本，不要当作保证。
+
 ## 长期记忆（Hindsight，可选）
 
 接入 [Hindsight](https://github.com/vectorize-io/hindsight) 后，Agent 对每个仓库（独立 memory bank：`cra-<owner>--<repo>`）记住并召回：
@@ -106,12 +139,20 @@ docker run -p 8888:8888 -p 9999:9999 -e HINDSIGHT_API_LLM_API_KEY=<key> ghcr.io/
 | `MAX_TOTAL_PATCH_CHARS` | `160000` | 单次审查送模型的 diff 总字符预算（按风险优先） |
 | `MAX_COMMIT_PAGES` | `5` | 读取提交文件列表的最大页数（每页 100 个） |
 | `HINDSIGHT_URL` | 空 | 为空则关闭长期记忆 |
+| `IMPACT_ANALYSIS` | `true` | 影响面分析（下载仓库快照 + tree-sitter） |
+| `IMPACT_ISOLATED` | `true` | 在子进程中解析，防止原生崩溃/卡死影响服务 |
+| `IMPACT_MAX_CALLERS` | `4` | 每个符号最多展示的调用方数 |
+| `IMPACT_EVIDENCE_CHARS` | `7000` | 每个文件的影响面证据字符上限 |
+| `SNAPSHOT_MAX_MB` | `80` | 仓库压缩包下载上限 |
+| `VERIFY_FINDINGS` | `true` | 对 major/critical 问题做二次验证 |
+| `VERIFY_MAX_FINDINGS` | `10` | 每次审查最多验证的问题数 |
+| `REVIEW_CACHE` | `true` | 缓存“相同输入”的单文件审查结果 |
 | `STATE_DIR` | 空 | 去重与记忆记账文件位置（跨重启持久化） |
 | `REVIEW_LANGUAGE` | `Simplified Chinese` | 评论语言 |
 
 ## 隐私与限制
 
-- 被审查的 diff 会发送到 DeepSeek API，请确认私有代码可以交给该服务处理。
+- 被审查的 diff（以及开启影响面分析时，仓库中调用方的短代码片段）会发送到 DeepSeek API，请确认私有代码可以交给该服务处理。
 - 审查是辅助手段：模型可能漏报或误报，不能替代人工评审和测试。
 - 评论内容不会包含 API 密钥或 GitHub token；日志里只记录错误类型，不记录代码或模型响应。
 - 重复投递去重持久化在 `STATE_DIR`（单机文件）；任务队列在进程内。单进程部署足够，多实例部署需要换成共享队列/存储。

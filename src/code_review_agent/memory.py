@@ -79,6 +79,15 @@ class HindsightBackend:
     def retain(self, bank_id: str, content: str, context: str, document_id: str, tags: list[str]) -> None:
         self._call(lambda c: c.retain(bank_id=bank_id, content=content, context=context, document_id=document_id, tags=tags, retain_async=True))
 
+    def close(self) -> None:
+        """Close the client on the thread that owns it, then stop that thread."""
+        if self._client is not None:
+            try:
+                self._executor.submit(self._client.close).result(timeout=5)
+            except Exception:
+                logger.debug("Hindsight client close failed.", exc_info=True)
+            self._client = None
+        self._executor.shutdown(wait=False)
 
 @dataclass(frozen=True)
 class MemoryContext:
@@ -126,6 +135,11 @@ class ProjectMemory:
         self._settings = settings
         self._state = state
         self._ready: set[str] = set()
+
+    def close(self) -> None:
+        close = getattr(self._backend, "close", None)
+        if callable(close):
+            close()
 
     # ---------------------------------------------------------------- bank ----
     def _ensure_bank(self, repo: str) -> str:

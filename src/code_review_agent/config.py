@@ -27,6 +27,13 @@ def _csv(name: str, default: str = "") -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     deepseek_api_key: str = field(default="", repr=False)
@@ -46,6 +53,21 @@ class Settings:
     llm_concurrency: int = 4
     review_language: str = "Simplified Chinese"
     state_dir: Path = _PROJECT_ROOT / ".state"
+    # Impact analysis: download the repository at the reviewed commit and find callers of changed symbols (tree-sitter)
+    impact_enabled: bool = True
+    impact_isolated: bool = True  # parse in a child process so a parser crash or hang cannot take the server down
+    impact_max_symbols_per_file: int = 6
+    impact_max_callers: int = 4
+    impact_evidence_chars: int = 7000
+    impact_max_scan_files: int = 20_000
+    impact_max_parse_files: int = 400
+    impact_time_budget_seconds: int = 25
+    snapshot_max_mb: int = 80
+    snapshot_keep: int = 6
+    # Second-pass verification of major/critical findings, and a cache of per-file model results
+    verify_findings: bool = True
+    verify_max_findings: int = 10
+    review_cache: bool = True
     # Hindsight long-term memory (disabled when hindsight_url is empty)
     hindsight_url: str = ""
     hindsight_api_key: str = field(default="", repr=False)
@@ -101,6 +123,19 @@ def load_settings() -> Settings:
         llm_concurrency=_int("LLM_CONCURRENCY", 4),
         review_language=os.environ.get("REVIEW_LANGUAGE", "Simplified Chinese").strip()[:40] or "Simplified Chinese",
         state_dir=Path(os.environ.get("STATE_DIR", "").strip() or _PROJECT_ROOT / ".state"),
+        impact_enabled=_bool("IMPACT_ANALYSIS", True),
+        impact_isolated=_bool("IMPACT_ISOLATED", True),
+        impact_max_symbols_per_file=_int("IMPACT_MAX_SYMBOLS_PER_FILE", 6),
+        impact_max_callers=_int("IMPACT_MAX_CALLERS", 4),
+        impact_evidence_chars=_int("IMPACT_EVIDENCE_CHARS", 7000, 1000),
+        impact_max_scan_files=_int("IMPACT_MAX_SCAN_FILES", 20_000, 100),
+        impact_max_parse_files=_int("IMPACT_MAX_PARSE_FILES", 400, 10),
+        impact_time_budget_seconds=_int("IMPACT_TIME_BUDGET_SECONDS", 25, 2),
+        snapshot_max_mb=_int("SNAPSHOT_MAX_MB", 80, 1),
+        snapshot_keep=_int("SNAPSHOT_KEEP", 6),
+        verify_findings=_bool("VERIFY_FINDINGS", True),
+        verify_max_findings=_int("VERIFY_MAX_FINDINGS", 10),
+        review_cache=_bool("REVIEW_CACHE", True),
         hindsight_url=os.environ.get("HINDSIGHT_URL", "").strip().rstrip("/"),
         hindsight_api_key=os.environ.get("HINDSIGHT_API_KEY", "").strip(),
         memory_recall_max_tokens=_int("MEMORY_RECALL_MAX_TOKENS", 1500, 200),

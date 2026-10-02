@@ -1,17 +1,20 @@
 """The LangGraph review workflow.
 
-fetch_changes -> triage -> recall_memory -> (fan out: one review_file per file, in parallel)
-              -> synthesize -> publish -> learn
+fetch_changes -> triage -> impact_analysis -> recall_memory -> (fan out: one review_file per file, in parallel)
+              -> verify -> synthesize -> publish -> learn
 
-* fetch_changes : read the commit / pull request files from GitHub (paginated) and redact secrets in the message
-* triage        : sensitive files become deterministic findings (never sent to the model); the rest are ranked by
-                  risk and fitted into a size budget instead of being taken front-to-back
-* recall_memory : ask Hindsight for conventions and maintainer feedback relevant to the change (optional)
-* review_file   : DeepSeek reviews one file in chunks; secrets are redacted first and found secrets become
-                  deterministic findings; every finding is validated against the real diff
-* synthesize    : merge/sort findings, derive the verdict from severities, ask DeepSeek for a short summary
-* publish       : update-or-create the commit comment (push) or PR summary comment plus new inline comments (PR)
-* learn         : feed trusted conventions and maintainer ratings back into Hindsight (skipped on dry runs)
+* fetch_changes   : read the commit / pull request files from GitHub (paginated) and redact secrets in the message
+* triage          : sensitive files become deterministic findings (never sent to the model); the rest are ranked by
+                    risk and fitted into a size budget instead of being taken front-to-back
+* impact_analysis : download the repository at the reviewed commit, parse it with tree-sitter and find the callers and
+                    tests of the symbols the diff touches (optional; evidence for the reviewer, not a verdict)
+* recall_memory   : ask Hindsight for conventions and maintainer feedback relevant to the change (optional)
+* review_file     : DeepSeek reviews one file in chunks with the impact evidence; secrets are redacted first and found
+                    secrets become deterministic findings; every finding is validated against the real diff
+* verify          : a skeptical second pass tries to refute each major/critical finding; refuted ones are dropped
+* synthesize      : merge/sort findings, derive the verdict from severities, ask DeepSeek for a short summary
+* publish         : update-or-create the commit comment (push) or PR summary comment plus new inline comments (PR)
+* learn           : feed trusted conventions and maintainer ratings back into Hindsight (skipped on dry runs)
 """
 
 from __future__ import annotations
@@ -25,14 +28,25 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from .cache import ReviewCache
 from .config import Settings
-from .diff_utils import annotate_patch, chunk_text, should_review
+from .diff_utils import annotate_patch, chunk_text, should_review, trim_patch
 from .github_client import GitHubClient, GitHubError
+from .impact import analyze_impact
+from .isolation import run_isolated
 from .llm import extract_json
 from .memory import ProjectMemory
 from .models import ChangedFile, FileReview, Finding, ReviewTarget
 from .prioritize import select_files
-from .prompts import FILE_REVIEW_SYSTEM, FILE_REVIEW_USER, MEMORY_BLOCK, SUMMARY_SYSTEM, SUMMARY_USER
+from .prompts import (
+    FILE_REVIEW_SYSTEM,
+    FILE_REVIEW_USER,
+    IMPACT_BLOCK,
+    MEMORY_BLOCK,
+    PROMPT_VERSION,
+    SUMMARY_SYSTEM,
+    SUMMARY_USER,
+)
 from .report import (
     MARKER,
     build_inline_comments,
@@ -43,6 +57,8 @@ from .report import (
     verdict_for,
 )
 from .secrets_guard import is_sensitive_path, redact, scan_added_lines, secret_finding, sensitive_file_finding
+from .snapshot import SnapshotProvider
+from .verify import verify_reviews
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +71,21 @@ MAX_MESSAGE_CHARS = 2000
 class ReviewState(TypedDict, total=False):
     target: dict[str, Any]
     commit_message: str
+    changed_paths: list[str]
     files: list[dict[str, Any]]
     skipped: list[str]
+    impact: dict[str, str]
+    impact_summary: list[str]
     memory: str
     memory_count: int
     # Parallel branches append to these lists; the reducer merges them.
     file_reviews: Annotated[list[dict[str, Any]], operator.add]
     errors: Annotated[list[str], operator.add]
+    # verify replaces (rather than appends to) the findings, so it writes its own key.
+    verified_reviews: list[dict[str, Any]]
+    verify_log: list[dict[str, Any]]
+    verify_dropped: int
+    verify_downgraded: int
     verdict: str
     summary: str
     report: str
@@ -72,6 +96,7 @@ class FileTask(TypedDict):
     file: dict[str, Any]
     commit_message: str
     memory: str
+    impact: str
 
 
 def _parse_findings(data: dict[str, Any] | None) -> list[Finding]:
@@ -81,10 +106,18 @@ def _parse_findings(data: dict[str, Any] | None) -> list[Finding]:
         return findings
     for item in raw_items[:MAX_FINDINGS_PER_CHUNK]:
         try:
-            findings.append(Finding.model_validate(item))
+            # origin is decided by code, never by the model (a model must not be able to mark itself as a rule).
+            findings.append(Finding.model_validate(item).model_copy(update={"origin": "model"}))
         except Exception:  # one malformed finding must not discard the rest
             continue
     return findings
+
+
+def _final_reviews(state: ReviewState) -> list[FileReview]:
+    source = state.get("verified_reviews")
+    if source is None:
+        source = state.get("file_reviews", [])
+    return [FileReview.model_validate(item) for item in source]
 
 
 def build_graph(
@@ -94,6 +127,8 @@ def build_graph(
     *,
     dry_run: bool = False,
     memory: ProjectMemory | None = None,
+    snapshots: SnapshotProvider | None = None,
+    cache: ReviewCache | None = None,
 ):
     """Compile the review graph. Dependencies are injected so tests can use fakes."""
 
@@ -105,7 +140,11 @@ def build_graph(
         else:
             message, files = github.get_commit(target.repo, target.sha, settings.max_commit_pages)
         safe_message, _ = redact(message)
-        return {"commit_message": safe_message[:MAX_MESSAGE_CHARS], "files": [file.model_dump() for file in files]}
+        return {
+            "commit_message": safe_message[:MAX_MESSAGE_CHARS],
+            "files": [file.model_dump() for file in files],
+            "changed_paths": [file.filename for file in files],
+        }
 
     def triage(state: ReviewState) -> dict[str, Any]:
         candidates: list[ChangedFile] = []
@@ -136,6 +175,28 @@ def build_graph(
             update["file_reviews"] = sensitive
         return update
 
+    def impact_analysis(state: ReviewState) -> dict[str, Any]:
+        """Evidence about who depends on the touched symbols. Best effort: any failure means "no evidence"."""
+        files = state.get("files", [])
+        if snapshots is None or not settings.impact_enabled or not files:
+            return {}
+        target = ReviewTarget.model_validate(state["target"])
+        try:
+            root = snapshots.get(target.repo, target.sha)
+            if root is None:
+                return {}
+            arguments = (root, [ChangedFile.model_validate(f) for f in files], set(state.get("changed_paths", [])), settings)
+            if settings.impact_isolated:
+                # Parsing untrusted files with native code: a crash or hang only costs this review's evidence.
+                report = run_isolated(analyze_impact, arguments, settings.impact_time_budget_seconds + 20)
+            else:
+                report = analyze_impact(*arguments)
+        except Exception as error:  # never let static analysis fail a review
+            logger.warning("Impact analysis failed (%s); reviewing without it.", type(error).__name__)
+            return {}
+        logger.info("Impact analysis for %s@%s: %s", target.repo, target.sha[:7], report.stats)
+        return {"impact": report.by_file, "impact_summary": report.summary}
+
     def recall_memory(state: ReviewState) -> dict[str, Any]:
         files = state.get("files", [])
         if memory is None or not files:
@@ -147,15 +208,18 @@ def build_graph(
     def dispatch(state: ReviewState) -> list[Send] | str:
         files = state.get("files", [])
         if not files:
-            return "synthesize"
-        message, recalled = state.get("commit_message", ""), state.get("memory", "")
-        return [Send("review_file", {"file": file, "commit_message": message, "memory": recalled}) for file in files]
+            return "verify"
+        message, recalled, impact = state.get("commit_message", ""), state.get("memory", ""), state.get("impact", {})
+        return [
+            Send("review_file", {"file": file, "commit_message": message, "memory": recalled, "impact": impact.get(file["filename"], "")})
+            for file in files
+        ]
 
     def review_file(task: FileTask) -> dict[str, Any]:
         file = ChangedFile.model_validate(task["file"])
-        patch = file.patch or ""
-        truncated = len(patch) > settings.max_patch_chars_per_file
-        annotated, valid_lines = annotate_patch(patch[: settings.max_patch_chars_per_file])
+        trimmed, omitted_hunks = trim_patch(file.patch or "", settings.max_patch_chars_per_file)
+        truncated = omitted_hunks > 0 or len(trimmed) < len(file.patch or "")
+        annotated, valid_lines = annotate_patch(trimmed)
 
         # Deterministic secret findings come from the raw text; the model only ever sees the redacted text.
         deterministic: list[Finding] = []
@@ -167,18 +231,37 @@ def build_graph(
         safe_text, _ = redact(annotated)
 
         chunks = chunk_text(safe_text, settings.max_chunk_chars)
-        memory_block = MEMORY_BLOCK.format(memory=task["memory"]) if task.get("memory") else ""
-        findings: list[Finding] = list(deterministic)
+        memory_text, impact_text = task.get("memory", ""), task.get("impact", "")
+        memory_block = MEMORY_BLOCK.format(memory=memory_text) if memory_text else ""
+        impact_block = IMPACT_BLOCK.format(impact=impact_text) if impact_text else ""
+        truncated_note = ""
+        if truncated:
+            truncated_note = f" (diff truncated: {omitted_hunks} hunk(s) in the middle are not shown)" if omitted_hunks else " (diff truncated)"
+        model_findings: list[Finding] = []
         errors: list[str] = []
+        cache_key = None
+        if cache is not None:
+            cache_key = cache.key(
+                settings.deepseek_model, PROMPT_VERSION, settings.review_language, file.filename, safe_text,
+                task.get("commit_message", ""), memory_text, impact_text,
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                try:
+                    model_findings = [Finding.model_validate(item).model_copy(update={"origin": "model"}) for item in cached]
+                    chunks = []  # nothing to ask the model
+                except Exception:
+                    model_findings = []
         system = FILE_REVIEW_SYSTEM.format(language=settings.review_language)
         for index, chunk in enumerate(chunks, start=1):
             user = FILE_REVIEW_USER.format(
                 filename=file.filename,
                 index=index,
                 total=len(chunks),
-                truncated=" (diff truncated: only the first part is shown)" if truncated else "",
+                truncated=truncated_note,
                 message=task.get("commit_message", ""),
                 memory_block=memory_block,
+                impact_block=impact_block,
                 diff=chunk,
             )
             try:
@@ -191,7 +274,10 @@ def build_graph(
             if parsed is None:
                 errors.append(f"{file.filename}: 模型未返回有效 JSON")
                 continue
-            findings.extend(_parse_findings(parsed))
+            model_findings.extend(_parse_findings(parsed))
+        if cache is not None and cache_key is not None and chunks and not errors:
+            cache.put(cache_key, [finding.model_dump() for finding in model_findings])
+        findings: list[Finding] = [*deterministic, *model_findings]
 
         # Only keep line anchors that really exist on added lines; otherwise report without a line.
         seen: set[tuple[int | None, str]] = set()
@@ -215,8 +301,31 @@ def build_graph(
             update["file_reviews"] = [review.model_dump()]
         return update
 
-    def synthesize(state: ReviewState) -> dict[str, Any]:
+    def verify(state: ReviewState) -> dict[str, Any]:
+        """Second pass: drop findings a skeptical reviewer can refute, lower the ones it cannot confirm."""
         reviews = [FileReview.model_validate(item) for item in state.get("file_reviews", [])]
+        if not settings.verify_findings or not reviews:
+            return {}
+        files = {item["filename"]: ChangedFile.model_validate(item) for item in state.get("files", [])}
+        try:
+            result = verify_reviews(llm, settings, reviews, files, state.get("impact", {}))
+        except Exception as error:  # verification only ever removes noise; its failure must not fail the review
+            logger.warning("Verification step failed (%s); publishing unverified findings.", type(error).__name__)
+            return {}
+        if result.log:
+            logger.info(
+                "Verification: %d checked, %d dropped, %d downgraded, %d unverified",
+                len(result.log), result.dropped, result.downgraded, result.failed,
+            )
+        return {
+            "verified_reviews": [review.model_dump() for review in result.reviews],
+            "verify_log": result.log,
+            "verify_dropped": result.dropped,
+            "verify_downgraded": result.downgraded,
+        }
+
+    def synthesize(state: ReviewState) -> dict[str, Any]:
+        reviews = _final_reviews(state)
         items = collect(reviews)
         findings = [finding for _, finding in items]
         verdict = verdict_for(findings)
@@ -238,7 +347,7 @@ def build_graph(
 
     def publish(state: ReviewState) -> dict[str, Any]:
         target = ReviewTarget.model_validate(state["target"])
-        reviews = [FileReview.model_validate(item) for item in state.get("file_reviews", [])]
+        reviews = _final_reviews(state)
 
         def render(inline_keys: set[tuple[str, int]] | None = None) -> str:
             return render_report(
@@ -251,6 +360,9 @@ def build_graph(
                 model=settings.deepseek_model,
                 inline_paths=inline_keys,
                 memory_used=int(state.get("memory_count", 0)),
+                impact_summary=state.get("impact_summary", []),
+                verify_dropped=int(state.get("verify_dropped", 0)),
+                verify_downgraded=int(state.get("verify_downgraded", 0)),
             )
 
         if dry_run:
@@ -302,16 +414,20 @@ def build_graph(
     builder = StateGraph(ReviewState)
     builder.add_node("fetch_changes", fetch_changes)
     builder.add_node("triage", triage)
+    builder.add_node("impact_analysis", impact_analysis)
     builder.add_node("recall_memory", recall_memory)
     builder.add_node("review_file", review_file)
+    builder.add_node("verify", verify)
     builder.add_node("synthesize", synthesize)
     builder.add_node("publish", publish)
     builder.add_node("learn", learn)
     builder.add_edge(START, "fetch_changes")
     builder.add_edge("fetch_changes", "triage")
-    builder.add_edge("triage", "recall_memory")
-    builder.add_conditional_edges("recall_memory", dispatch, ["review_file", "synthesize"])
-    builder.add_edge("review_file", "synthesize")
+    builder.add_edge("triage", "impact_analysis")
+    builder.add_edge("impact_analysis", "recall_memory")
+    builder.add_conditional_edges("recall_memory", dispatch, ["review_file", "verify"])
+    builder.add_edge("review_file", "verify")
+    builder.add_edge("verify", "synthesize")
     builder.add_edge("synthesize", "publish")
     builder.add_edge("publish", "learn")
     builder.add_edge("learn", END)

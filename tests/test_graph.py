@@ -11,7 +11,7 @@ from code_review_agent.state import StateStore
 
 PATCH_A = "@@ -1,2 +1,3 @@\n import os\n+token = os.environ['X']\n+print(token)\n x = 1\n"
 PATCH_SECRET = "@@ -0,0 +1,2 @@\n+import os\n+API_KEY_VALUE = 'ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'\n"
-SETTINGS = Settings(deepseek_api_key="k", github_token="t", github_webhook_secret="s" * 20, llm_concurrency=2)
+SETTINGS = Settings(deepseek_api_key="k", github_token="t", github_webhook_secret="s" * 20, llm_concurrency=2, verify_findings=False)
 
 
 class FakeMessage:
@@ -20,15 +20,19 @@ class FakeMessage:
 
 
 class FakeLLM:
-    def __init__(self, finding_json=None, fail=False):
+    def __init__(self, finding_json=None, fail=False, verdicts=None):
         self.calls = []
         self.finding_json = finding_json
         self.fail = fail
+        self.verdicts = verdicts or {}  # finding title -> verdict for verification calls
 
     def invoke(self, messages):
         self.calls.append(messages)
         if self.fail:
             raise RuntimeError("boom")
+        if messages[0].content.startswith("You are a skeptical senior reviewer"):
+            title = next((line[7:] for line in messages[1].content.splitlines() if line.startswith("title: ")), "")
+            return FakeMessage(json.dumps({"verdict": self.verdicts.get(title, "confirmed"), "reason": "checked"}))
         if messages[0].content.startswith("You write the overall summary"):
             return FakeMessage(json.dumps({"summary": "Adds logging. See @octocat ![x](http://evil/x.png)"}))
         return FakeMessage(

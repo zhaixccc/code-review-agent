@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -27,7 +28,8 @@ class GitHubError(RuntimeError):
 
 
 def validate_repo(repo: str) -> str:
-    if not _REPO_RE.match(repo):
+    # "../x" satisfies the character class but would escape the /repos/ URL prefix: dot-only segments are never valid.
+    if not _REPO_RE.match(repo) or any(set(part) == {"."} for part in repo.split("/")):
         raise ValueError("repo must look like 'owner/name'.")
     return repo
 
@@ -118,6 +120,26 @@ class GitHubClient:
         if int(data.get("size", 0) or 0) > MAX_FILE_BYTES:
             return None
         return base64.b64decode(data.get("content", "")).decode("utf-8", "replace")
+
+    # --- writing comments -------------------------------------------------------
+    def download_archive(self, repo: str, sha: str, destination: Path, max_bytes: int) -> int:
+        """Stream the repository tarball at a commit to ``destination`` (aborts when it exceeds ``max_bytes``)."""
+        path = f"/repos/{validate_repo(repo)}/tarball/{validate_sha(sha)}"
+        size = 0
+        try:
+            # The API redirects to codeload; httpx drops the Authorization header on cross-origin redirects.
+            with self._http.stream("GET", path, follow_redirects=True) as response:
+                if response.status_code >= 400:
+                    raise GitHubError(f"GitHub API returned HTTP {response.status_code} for GET {path}", response.status_code)
+                with open(destination, "wb") as stream:
+                    for chunk in response.iter_bytes(65_536):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise GitHubError("repository archive is larger than the configured limit")
+                        stream.write(chunk)
+        except httpx.HTTPError as error:
+            raise GitHubError(f"GitHub archive download failed: {type(error).__name__}") from error
+        return size
 
     # --- writing comments -------------------------------------------------------
     def upsert_commit_comment(self, repo: str, sha: str, body: str, marker: str) -> str:

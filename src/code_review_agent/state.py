@@ -69,3 +69,14 @@ class StateStore:
         with self._lock:
             self._data.setdefault(namespace, {})[key] = value
             self._save()
+
+    def trim(self, namespace: str, max_entries: int, timestamp_field: str = "t") -> None:
+        """Keep only the newest ``max_entries`` values of a namespace (values are dicts carrying a timestamp)."""
+        with self._lock:
+            entries: dict[str, Any] = self._data.get(namespace, {})
+            if len(entries) <= max_entries:
+                return
+            ordered = sorted(entries, key=lambda k: float((entries[k] or {}).get(timestamp_field, 0)))
+            for old in ordered[: len(entries) - max_entries]:
+                del entries[old]
+            self._save()

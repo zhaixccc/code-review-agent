@@ -21,6 +21,28 @@ _CODE_SUFFIXES = {
 }
 _DOC_SUFFIXES = {".md", ".rst", ".txt", ".adoc"}
 _TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec|e2e)(/|$)|(_test|\.test|\.spec)\.[a-z0-9]+$|(^|/)test_[^/]+$", re.IGNORECASE)
+_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
+
+
+def is_test_path(path: str) -> bool:
+    return bool(_TEST_RE.search(path.replace("\\", "/")))
+
+
+def _tokens(path: str) -> set[str]:
+    """Lower-cased words of a path: split on separators and camelCase, so ``feedback`` is not ``db`` and ``design`` is not ``sign``."""
+    words: set[str] = set()
+    for part in re.split(r"[^A-Za-z0-9]+", path):
+        words.update(word.lower() for word in _WORD_RE.findall(part))
+    return words
+
+
+def _risk_hits(path: str) -> int:
+    words = _tokens(path)
+    hits = 0
+    for term in _HIGH_RISK_TOKENS:
+        if term in words or (len(term) >= 4 and any(word.startswith(term) for word in words)):
+            hits += 1
+    return hits
 
 
 def risk_score(file: ChangedFile) -> float:
@@ -36,8 +58,7 @@ def risk_score(file: ChangedFile) -> float:
         score -= 2.5
     if _TEST_RE.search(path):
         score -= 1.5
-    haystack = "/".join(pure.parts)
-    score += min(4.0, 1.0 * sum(token in haystack for token in _HIGH_RISK_TOKENS))
+    score += min(4.0, 1.0 * _risk_hits(path))
     # More changed lines mean more room for mistakes, with diminishing returns.
     score += min(3.0, (file.additions + 0.5 * file.deletions) / 60)
     return score

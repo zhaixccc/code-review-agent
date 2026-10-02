@@ -11,12 +11,14 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
+from .cache import build_cache
 from .config import Settings
 from .github_client import GitHubClient
 from .graph import build_graph, run_review
 from .llm import make_llm
 from .memory import build_memory
 from .models import ReviewTarget
+from .snapshot import build_snapshots
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -73,7 +75,10 @@ def create_app(
     store = state or StateStore(settings.state_dir)
     if graph is None:
         github = GitHubClient(settings.github_token, settings.github_api_url)
-        graph = build_graph(settings, github, make_llm(settings), memory=build_memory(settings, store))
+        graph = build_graph(
+            settings, github, make_llm(settings), memory=build_memory(settings, store),
+            snapshots=build_snapshots(settings, github), cache=build_cache(settings),
+        )
     compiled = graph
     slots = threading.BoundedSemaphore(max_parallel_reviews)
 

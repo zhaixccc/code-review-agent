@@ -101,6 +101,7 @@ def scan_added_lines(annotated_patch: str) -> list[tuple[int, str]]:
 
 def secret_finding(kind: str, line: int | None) -> Finding:
     return Finding(
+        origin="rule",
         severity="critical",
         category="security",
         line=line,
@@ -112,6 +113,7 @@ def secret_finding(kind: str, line: int | None) -> Finding:
 
 def sensitive_file_finding(filename: str) -> Finding:
     return Finding(
+        origin="rule",
         severity="critical",
         category="security",
         line=None,

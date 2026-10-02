@@ -60,6 +60,70 @@ def annotate_patch(patch: str) -> tuple[str, set[int]]:
     return "\n".join(output), added
 
 
+def changed_new_lines(patch: str) -> tuple[set[int], set[tuple[int, int]]]:
+    """(added new-file lines, deletion gaps).
+
+    A gap ``(a, b)`` says text was removed between new-file lines ``a`` and ``b``. A removed parameter line leaves no
+    added line, so gaps are how a change *inside* a signature (both neighbours in the signature) is told apart from a
+    deletion right after it (for example a removed docstring).
+    """
+    added: set[int] = set()
+    gaps: set[tuple[int, int]] = set()
+    new_line: int | None = None
+    for raw in patch.splitlines():
+        hunk = _HUNK_RE.match(raw)
+        if hunk:
+            new_line = int(hunk.group(1))
+            continue
+        if new_line is None or raw.startswith("\\"):
+            continue
+        if raw.startswith("+"):
+            added.add(new_line)
+            new_line += 1
+        elif raw.startswith("-"):
+            gaps.add((max(0, new_line - 1), new_line))
+        else:
+            new_line += 1
+    return added, gaps
+
+
+def trim_patch(patch: str, max_chars: int) -> tuple[str, int]:
+    """Fit a patch into max_chars by whole hunks, keeping hunks from BOTH ends (risk is not only at the top).
+
+    Returns (patch, number of omitted hunks). A single oversized hunk is cut at a line boundary.
+    """
+    if len(patch) <= max_chars:
+        return patch, 0
+    hunks: list[list[str]] = []
+    for raw in patch.splitlines():
+        if _HUNK_RE.match(raw) or not hunks:
+            hunks.append([raw])
+        else:
+            hunks[-1].append(raw)
+    texts = ["\n".join(lines) for lines in hunks]
+    keep: set[int] = set()
+    used = 0
+    lo, hi = 0, len(texts) - 1
+    take_front = True
+    while lo <= hi:
+        index = lo if take_front else hi
+        cost = len(texts[index]) + 1
+        if used + cost > max_chars:
+            if not keep:  # even the first hunk does not fit: cut it
+                texts[index] = texts[index][:max_chars].rsplit("\n", 1)[0]
+                keep.add(index)
+            break
+        keep.add(index)
+        used += cost
+        if take_front:
+            lo += 1
+        else:
+            hi -= 1
+        take_front = not take_front
+    kept = [texts[i] for i in sorted(keep)]
+    return "\n".join(kept), len(texts) - len(keep)
+
+
 def chunk_text(text: str, max_chars: int) -> list[str]:
     """Split on line boundaries so each chunk stays under max_chars (single long lines are cut)."""
     if len(text) <= max_chars:

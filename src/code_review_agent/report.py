@@ -91,12 +91,17 @@ def render_report(
     model: str,
     inline_paths: set[tuple[str, int]] | None = None,
     memory_used: int = 0,
+    impact_summary: list[str] | None = None,
+    verify_dropped: int = 0,
+    verify_downgraded: int = 0,
 ) -> str:
     items = collect(file_reviews)
     counts = {severity: sum(1 for _, finding in items if finding.severity == severity) for severity in SEVERITY_ORDER}
     parts = [MARKER, f"## 自动代码审查（`{sha[:7]}`）", f"**结论：** {VERDICT_TEXT.get(verdict, verdict)}"]
     if summary:
         parts.append(sanitize(summary))
+    if impact_summary:
+        parts.append("### 影响面\n" + "\n".join(f"- {sanitize(line)}" for line in impact_summary))
     if items:
         parts.append("**问题统计：** " + " · ".join(f"{name} {count}" for name, count in counts.items() if count))
         parts.append("### 发现的问题")
@@ -117,6 +122,8 @@ def render_report(
         notes.append(f"{len(errors)} 个审查步骤失败，结果可能不完整")
     if memory_used:
         notes.append(f"参考了 {memory_used} 条项目记忆（Hindsight）")
+    if verify_dropped or verify_downgraded:
+        notes.append(f"二次验证：剔除 {verify_dropped} 条、降级 {verify_downgraded} 条未能证实的问题")
     parts.append("---")
     parts.append("<sub>" + "；".join(sanitize(note) for note in notes) + f"。由 LangGraph + DeepSeek（{model}）自动生成，仅供参考，请人工复核。</sub>")
     return "\n\n".join(parts)
