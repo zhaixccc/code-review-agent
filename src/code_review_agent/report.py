@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
 from .models import SEVERITY_ORDER, FileReview, Finding
 
 MARKER = "<!-- code-review-agent -->"
+INLINE_MARKER = "<!-- cra-inline"
+_FP_RE = re.compile(r"<!-- cra-inline fp=([0-9a-f]{12}) -->")
 
 _MENTION_RE = re.compile(r"@(?=[A-Za-z0-9_-])")
 _RISKY_TAG_RE = re.compile(r"<(?=/?(?:img|a|iframe|script|style|picture|source|video|audio|object|embed|link|meta|svg)\b|!--)", re.IGNORECASE)
@@ -49,6 +52,34 @@ def render_finding(path: str, finding: Finding, with_location: bool = True) -> s
     return "\n".join(lines)
 
 
+def fingerprint(path: str, finding: Finding) -> str:
+    """Stable across line shifts and re-runs: the same problem in the same file gets the same id."""
+    normalized = re.sub(r"[\W_]+", "", finding.title.lower())
+    return hashlib.sha1(f"{path}|{finding.category}|{normalized}".encode("utf-8")).hexdigest()[:12]
+
+
+def fingerprint_from_body(body: str) -> str | None:
+    match = _FP_RE.search(body)
+    return match.group(1) if match else None
+
+
+def existing_fingerprints(comments: list[dict[str, Any]], me: str) -> tuple[set[str], set[tuple[str, int]]]:
+    """Fingerprints and (path, line) anchors of this agent's earlier inline comments on a pull request."""
+    fingerprints: set[str] = set()
+    anchors: set[tuple[str, int]] = set()
+    for comment in comments:
+        body = str(comment.get("body", ""))
+        if INLINE_MARKER not in body or str((comment.get("user") or {}).get("login", "")).lower() != me.lower():
+            continue
+        match = _FP_RE.search(body)
+        if match:
+            fingerprints.add(match.group(1))
+        line = comment.get("line") or comment.get("original_line")
+        if comment.get("path") and line:
+            anchors.add((str(comment["path"]), int(line)))
+    return fingerprints, anchors
+
+
 def render_report(
     *,
     sha: str,
@@ -59,6 +90,7 @@ def render_report(
     errors: list[str],
     model: str,
     inline_paths: set[tuple[str, int]] | None = None,
+    memory_used: int = 0,
 ) -> str:
     items = collect(file_reviews)
     counts = {severity: sum(1 for _, finding in items if finding.severity == severity) for severity in SEVERITY_ORDER}
@@ -83,6 +115,8 @@ def render_report(
         notes.append(f"跳过 {len(skipped)} 个文件（{'; '.join(skipped[:5])}{' …' if len(skipped) > 5 else ''}）")
     if errors:
         notes.append(f"{len(errors)} 个审查步骤失败，结果可能不完整")
+    if memory_used:
+        notes.append(f"参考了 {memory_used} 条项目记忆（Hindsight）")
     parts.append("---")
     parts.append("<sub>" + "；".join(sanitize(note) for note in notes) + f"。由 LangGraph + DeepSeek（{model}）自动生成，仅供参考，请人工复核。</sub>")
     return "\n\n".join(parts)
@@ -95,7 +129,7 @@ def build_inline_comments(file_reviews: list[FileReview]) -> list[dict[str, Any]
         valid = set(review.valid_lines)
         for finding in review.findings:
             if finding.line and finding.line in valid:
-                body = f"**[{finding.severity}/{finding.category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
+                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{finding.severity}/{finding.category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
                 if finding.suggestion:
                     body += f"\n\n建议：{sanitize(finding.suggestion)}"
                 comments.append({"path": review.filename, "line": finding.line, "side": "RIGHT", "body": body})

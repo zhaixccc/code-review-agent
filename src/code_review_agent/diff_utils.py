@@ -16,7 +16,8 @@ _SKIP_NAMES = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "pipfile.lock", "cargo.lock",
     "go.sum", "composer.lock", "gemfile.lock",
 }
-_SKIP_DIRS = {"node_modules", "vendor", "dist", "build", ".next", "__pycache__", "venv", ".venv", "third_party"}
+# Only clearly vendored/generated directories. Not "build": many repos keep real build scripts there.
+_SKIP_DIRS = {"node_modules", "vendor", "dist", ".next", "__pycache__", "venv", ".venv", "third_party"}
 
 
 def should_review(filename: str) -> bool:

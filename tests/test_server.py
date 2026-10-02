@@ -2,10 +2,12 @@ import hashlib
 import hmac
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from code_review_agent.config import Settings
 from code_review_agent.server import create_app, parse_event, verify_signature
+from code_review_agent.state import StateStore
 
 SECRET = "x" * 32
 SETTINGS = Settings(
@@ -93,9 +95,9 @@ def post(client, payload, event="push", secret=SECRET):
     )
 
 
-def test_webhook_flow():
+def test_webhook_flow(tmp_path):
     graph = FakeGraph()
-    client = TestClient(create_app(SETTINGS, graph=graph))
+    client = TestClient(create_app(SETTINGS, graph=graph, state=StateStore(tmp_path)))
 
     assert client.get("/healthz").json() == {"status": "ok"}
     assert post(client, {}, event="ping").json() == {"status": "pong"}
@@ -111,16 +113,24 @@ def test_webhook_flow():
     assert again.json()["status"] == "ignored" and len(graph.targets) == 2
 
 
-def test_webhook_rejects_malformed_payload_and_ignores_irrelevant_events():
-    client = TestClient(create_app(SETTINGS, graph=FakeGraph()))
+def test_deduplication_survives_a_restart(tmp_path):
+    first = FakeGraph()
+    post(TestClient(create_app(SETTINGS, graph=first, state=StateStore(tmp_path))), push_payload())
+    assert len(first.targets) == 2
+
+    second = FakeGraph()  # a brand-new app and state object, same state directory
+    response = post(TestClient(create_app(SETTINGS, graph=second, state=StateStore(tmp_path))), push_payload())
+    assert response.json()["status"] == "ignored" and second.targets == []
+
+
+def test_webhook_rejects_malformed_payload_and_ignores_irrelevant_events(tmp_path):
+    client = TestClient(create_app(SETTINGS, graph=FakeGraph(), state=StateStore(tmp_path)))
     body = b"not json"
     response = client.post("/webhook/github", content=body, headers={"X-Hub-Signature-256": sign(body), "X-GitHub-Event": "push"})
     assert response.status_code == 400
     assert post(client, {"zen": "x"}, event="issues").json()["status"] == "ignored"
 
 
-def test_app_requires_webhook_secret():
-    import pytest
-
+def test_app_requires_webhook_secret(tmp_path):
     with pytest.raises(RuntimeError):
-        create_app(Settings(deepseek_api_key="k", github_token="t", github_webhook_secret="short"), graph=FakeGraph())
+        create_app(Settings(deepseek_api_key="k", github_token="t", github_webhook_secret="short"), graph=FakeGraph(), state=StateStore(tmp_path))

@@ -7,8 +7,7 @@ import hmac
 import json
 import logging
 import threading
-from collections import OrderedDict
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
@@ -16,7 +15,9 @@ from .config import Settings
 from .github_client import GitHubClient
 from .graph import build_graph, run_review
 from .llm import make_llm
+from .memory import build_memory
 from .models import ReviewTarget
+from .state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -60,35 +61,20 @@ def parse_event(event: str, payload: dict[str, Any], settings: Settings) -> list
     return []
 
 
-class _Deduplicator:
-    """GitHub retries deliveries; remember recent targets so the same commit is reviewed once."""
-
-    def __init__(self, capacity: int = 2000) -> None:
-        self._seen: OrderedDict[tuple[str, str, int | None], None] = OrderedDict()
-        self._capacity = capacity
-        self._lock = threading.Lock()
-
-    def first_time(self, target: ReviewTarget) -> bool:
-        key = (target.repo.lower(), target.sha.lower(), target.pr_number)
-        with self._lock:
-            if key in self._seen:
-                return False
-            self._seen[key] = None
-            while len(self._seen) > self._capacity:
-                self._seen.popitem(last=False)
-            return True
-
-    def forget(self, target: ReviewTarget) -> None:
-        with self._lock:
-            self._seen.pop((target.repo.lower(), target.sha.lower(), target.pr_number), None)
+def review_key(target: ReviewTarget) -> str:
+    return f"{target.repo.lower()}@{target.sha.lower()}#{target.pr_number or 0}"
 
 
-def create_app(settings: Settings, graph: Any | None = None, max_parallel_reviews: int = 2) -> FastAPI:
+def create_app(
+    settings: Settings, graph: Any | None = None, max_parallel_reviews: int = 2, state: StateStore | None = None
+) -> FastAPI:
     settings.require_webhook()
     app = FastAPI(title="code-review-agent", docs_url=None, redoc_url=None, openapi_url=None)
-    github = GitHubClient(settings.github_token, settings.github_api_url)
-    compiled = graph or build_graph(settings, github, make_llm(settings))
-    dedupe = _Deduplicator()
+    store = state or StateStore(settings.state_dir)
+    if graph is None:
+        github = GitHubClient(settings.github_token, settings.github_api_url)
+        graph = build_graph(settings, github, make_llm(settings), memory=build_memory(settings, store))
+    compiled = graph
     slots = threading.BoundedSemaphore(max_parallel_reviews)
 
     def review(target: ReviewTarget) -> None:
@@ -100,10 +86,10 @@ def create_app(settings: Settings, graph: Any | None = None, max_parallel_review
                     target.repo, target.sha[:7], result.get("verdict"), result.get("posted"), len(result.get("errors", [])),
                 )
                 if not result.get("posted") and result.get("errors"):
-                    dedupe.forget(target)  # allow a redelivery to retry after a failure
+                    store.release_review(review_key(target))  # allow a redelivery to retry after a failure
             except Exception:
                 logger.exception("Review failed for %s@%s", target.repo, target.sha[:7])
-                dedupe.forget(target)
+                store.release_review(review_key(target))
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -131,12 +117,12 @@ def create_app(settings: Settings, graph: Any | None = None, max_parallel_review
             targets = parse_event(x_github_event or "", payload, settings)
         except (ValueError, KeyError, TypeError):
             raise HTTPException(status_code=400, detail="Malformed payload") from None
-        queued = [target for target in targets if dedupe.first_time(target)]
+        queued = [target for target in targets if store.claim_review(review_key(target))]
         for target in queued:
             background.add_task(review, target)
         return {"status": "queued" if queued else "ignored", "reviews": len(queued)}
 
-    app.state.dedupe = dedupe
+    app.state.store = store
     return app
 
 

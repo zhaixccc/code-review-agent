@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+memory = ["hindsight-client>=0.10"]
 
 [project.scripts]
 code-review-agent = "code_review_agent.cli:main"
@@ -30,3 +31,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "--basetemp=.pytest_tmp"

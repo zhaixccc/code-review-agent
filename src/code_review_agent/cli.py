@@ -10,7 +10,9 @@ from .config import load_settings
 from .github_client import GitHubClient, GitHubError, validate_repo, validate_sha
 from .graph import build_graph, run_review
 from .llm import make_llm
+from .memory import build_memory
 from .models import ReviewTarget
+from .state import StateStore
 
 
 def _review(args: argparse.Namespace) -> int:
@@ -21,7 +23,8 @@ def _review(args: argparse.Namespace) -> int:
     target = ReviewTarget(repo=validate_repo(args.repo), sha=validate_sha(args.sha), pr_number=args.pr)
     github = GitHubClient(settings.github_token, settings.github_api_url)
     try:
-        graph = build_graph(settings, github, make_llm(settings), dry_run=not args.post)
+        memory = None if args.no_memory else build_memory(settings, StateStore(settings.state_dir))
+        graph = build_graph(settings, github, make_llm(settings), dry_run=not args.post, memory=memory)
         result = run_review(graph, target, settings)
     finally:
         github.close()
@@ -31,6 +34,36 @@ def _review(args: argparse.Namespace) -> int:
     if args.post:
         print("已发布到 GitHub。" if result.get("posted") else "未发布评论。", file=sys.stderr)
     return 1 if result.get("errors") and not result.get("file_reviews") else 0
+
+
+def _require_memory(settings):
+    memory = build_memory(settings, StateStore(settings.state_dir))
+    if memory is None:
+        raise RuntimeError("HINDSIGHT_URL is not set; long-term memory is disabled.")
+    return memory
+
+
+def _learn(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    settings.require_github_write()
+    memory = _require_memory(settings)
+    github = GitHubClient(settings.github_token, settings.github_api_url)
+    try:
+        repo = validate_repo(args.repo)
+        conventions = memory.learn_conventions(github, repo)
+        feedback = memory.learn_feedback(github, repo) if not args.skip_feedback else 0
+    finally:
+        github.close()
+    print(f"已写入记忆：规范文档 {conventions} 份，维护者反馈 {feedback} 条。")
+    return 0
+
+
+def _recall(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    memory = _require_memory(settings)
+    context = memory.recall_for_review(validate_repo(args.repo), args.path or ["src/example.py"], args.query or "")
+    print(context.text or "(没有召回到记忆，或记忆服务不可用)")
+    return 0
 
 
 def _serve(_: argparse.Namespace) -> int:
@@ -57,7 +90,19 @@ def main(argv: list[str] | None = None) -> int:
     review.add_argument("--sha", required=True, help="commit sha (for a PR: the head commit)")
     review.add_argument("--pr", type=int, default=None, help="pull request number")
     review.add_argument("--post", action="store_true", help="post the review to GitHub")
+    review.add_argument("--no-memory", action="store_true", help="do not use Hindsight memory for this run")
     review.set_defaults(handler=_review)
+
+    learn = commands.add_parser("learn", help="retain repository conventions and maintainer feedback into Hindsight")
+    learn.add_argument("--repo", required=True, help="owner/name")
+    learn.add_argument("--skip-feedback", action="store_true", help="only ingest convention documents")
+    learn.set_defaults(handler=_learn)
+
+    recall = commands.add_parser("recall", help="show what memory would be given to a review")
+    recall.add_argument("--repo", required=True, help="owner/name")
+    recall.add_argument("--path", action="append", help="changed file path (repeatable)")
+    recall.add_argument("--query", default="", help="extra text, e.g. a commit headline")
+    recall.set_defaults(handler=_recall)
 
     serve = commands.add_parser("serve", help="run the GitHub webhook server")
     serve.set_defaults(handler=_serve)

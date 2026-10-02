@@ -39,6 +39,7 @@ def test_annotate_patch_ignores_no_newline_marker():
         ("static/app.min.js", False),
         ("logo.PNG", False),
         ("node_modules/x/index.js", False),
+        ("build/agentHost/generateMetadata.ts", True),
         ("docs/readme.md", True),
     ],
 )

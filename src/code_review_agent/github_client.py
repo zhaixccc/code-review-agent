@@ -1,7 +1,8 @@
-"""Minimal GitHub REST client (read commits / PR files, write review comments)."""
+"""Minimal GitHub REST client (read commits / PR files, write review comments, read maintainer feedback)."""
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from typing import Any
@@ -14,7 +15,9 @@ logger = logging.getLogger(__name__)
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.@/-]{1,200}$")
 MAX_COMMENT_CHARS = 60_000
+MAX_FILE_BYTES = 200_000
 
 
 class GitHubError(RuntimeError):
@@ -35,6 +38,12 @@ def validate_sha(sha: str) -> str:
     return sha
 
 
+def validate_repo_path(path: str) -> str:
+    if not _SAFE_PATH_RE.match(path) or ".." in path.split("/") or path.startswith("/"):
+        raise ValueError("invalid repository path")
+    return path
+
+
 class GitHubClient:
     def __init__(self, token: str = "", api_url: str = "https://api.github.com", client: httpx.Client | None = None) -> None:
         headers = {
@@ -46,6 +55,7 @@ class GitHubClient:
             headers["Authorization"] = f"Bearer {token}"
         self._http = client or httpx.Client(base_url=api_url, headers=headers, timeout=30.0)
         self._has_token = bool(token)
+        self._login: str | None = None
 
     def close(self) -> None:
         self._http.close()
@@ -60,15 +70,31 @@ class GitHubClient:
             raise GitHubError(f"GitHub API returned HTTP {response.status_code} for {method} {path.split('?')[0]}", response.status_code)
         return response.json() if response.content else None
 
-    def get_commit(self, repo: str, sha: str) -> tuple[str, list[ChangedFile]]:
-        """Return (commit message, changed files) for a commit."""
-        data = self._request("GET", f"/repos/{validate_repo(repo)}/commits/{validate_sha(sha)}")
-        message = str((data.get("commit") or {}).get("message") or "")
-        return message, [self._file(item) for item in data.get("files") or []]
+    # --- identity ---------------------------------------------------------------
+    def authenticated_login(self) -> str:
+        if self._login is None:
+            self._login = str(self._request("GET", "/user").get("login", ""))
+        return self._login
 
-    def get_pull_request_files(self, repo: str, number: int, max_pages: int = 3) -> list[ChangedFile]:
+    # --- reading changes --------------------------------------------------------
+    def get_commit(self, repo: str, sha: str, max_pages: int = 5) -> tuple[str, list[ChangedFile]]:
+        """Return (commit message, changed files); the files list is paginated by GitHub for large commits."""
+        path = f"/repos/{validate_repo(repo)}/commits/{validate_sha(sha)}"
+        message = ""
         files: list[ChangedFile] = []
-        for page in range(1, max_pages + 1):
+        for page in range(1, max(1, max_pages) + 1):
+            data = self._request("GET", path, params={"per_page": 100, "page": page})
+            if page == 1:
+                message = str((data.get("commit") or {}).get("message") or "")
+            batch = data.get("files") or []
+            files.extend(self._file(item) for item in batch)
+            if len(batch) < 100:
+                break
+        return message, files
+
+    def get_pull_request_files(self, repo: str, number: int, max_pages: int = 5) -> list[ChangedFile]:
+        files: list[ChangedFile] = []
+        for page in range(1, max(1, max_pages) + 1):
             batch = self._request("GET", f"/repos/{validate_repo(repo)}/pulls/{int(number)}/files", params={"per_page": 100, "page": page})
             files.extend(self._file(item) for item in batch or [])
             if not batch or len(batch) < 100:
@@ -79,35 +105,91 @@ class GitHubClient:
         data = self._request("GET", f"/repos/{validate_repo(repo)}/pulls/{int(number)}")
         return f"{data.get('title', '')}\n\n{data.get('body') or ''}".strip()
 
-    def post_commit_comment(self, repo: str, sha: str, body: str) -> None:
-        self._require_token()
-        self._request("POST", f"/repos/{validate_repo(repo)}/commits/{validate_sha(sha)}/comments", json={"body": body[:MAX_COMMENT_CHARS]})
-
-    def post_pull_request_review(
-        self,
-        repo: str,
-        number: int,
-        sha: str,
-        body: str,
-        inline: list[dict[str, Any]] | None = None,
-        fallback_body: str | None = None,
-    ) -> None:
-        """Post a COMMENT review. If inline anchors are rejected (HTTP 422), retry with fallback_body only."""
-        self._require_token()
-        path = f"/repos/{validate_repo(repo)}/pulls/{int(number)}/reviews"
-        payload: dict[str, Any] = {"commit_id": validate_sha(sha), "body": body[:MAX_COMMENT_CHARS], "event": "COMMENT"}
-        if inline:
-            payload["comments"] = inline[:50]
+    def get_repository_file(self, repo: str, path: str) -> str | None:
+        """Read a text file from the repository's DEFAULT branch (never from a PR head)."""
         try:
-            self._request("POST", path, json=payload)
+            data = self._request("GET", f"/repos/{validate_repo(repo)}/contents/{validate_repo_path(path)}")
         except GitHubError as error:
-            if inline and error.status_code == 422:
-                logger.warning("Inline review comments were rejected; posting the summary only.")
-                payload.pop("comments", None)
-                payload["body"] = (fallback_body or body)[:MAX_COMMENT_CHARS]
-                self._request("POST", path, json=payload)
-            else:
-                raise
+            if error.status_code == 404:
+                return None
+            raise
+        if not isinstance(data, dict) or data.get("type") != "file" or data.get("encoding") != "base64":
+            return None
+        if int(data.get("size", 0) or 0) > MAX_FILE_BYTES:
+            return None
+        return base64.b64decode(data.get("content", "")).decode("utf-8", "replace")
+
+    # --- writing comments -------------------------------------------------------
+    def upsert_commit_comment(self, repo: str, sha: str, body: str, marker: str) -> str:
+        """Update the agent's existing comment on this commit, or create one. Returns 'updated' or 'created'."""
+        self._require_token()
+        base = f"/repos/{validate_repo(repo)}/commits/{validate_sha(sha)}/comments"
+        existing = self._own_comment(self._list(base, max_pages=3), marker)
+        if existing is not None:
+            self._request("PATCH", f"/repos/{validate_repo(repo)}/comments/{int(existing['id'])}", json={"body": body[:MAX_COMMENT_CHARS]})
+            return "updated"
+        self._request("POST", base, json={"body": body[:MAX_COMMENT_CHARS]})
+        return "created"
+
+    def upsert_issue_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+        self._require_token()
+        base = f"/repos/{validate_repo(repo)}/issues/{int(number)}/comments"
+        existing = self._own_comment(self._list(base, max_pages=5), marker)
+        if existing is not None:
+            self._request("PATCH", f"/repos/{validate_repo(repo)}/issues/comments/{int(existing['id'])}", json={"body": body[:MAX_COMMENT_CHARS]})
+            return "updated"
+        self._request("POST", base, json={"body": body[:MAX_COMMENT_CHARS]})
+        return "created"
+
+    def list_pull_request_review_comments(self, repo: str, number: int) -> list[dict[str, Any]]:
+        return self._list(f"/repos/{validate_repo(repo)}/pulls/{int(number)}/comments", max_pages=5)
+
+    def post_pull_request_review(self, repo: str, number: int, sha: str, body: str, inline: list[dict[str, Any]]) -> bool:
+        """Post a COMMENT review with inline comments. Returns False if GitHub rejects the anchors (HTTP 422)."""
+        self._require_token()
+        payload: dict[str, Any] = {
+            "commit_id": validate_sha(sha), "body": body[:MAX_COMMENT_CHARS], "event": "COMMENT", "comments": inline[:50],
+        }
+        try:
+            self._request("POST", f"/repos/{validate_repo(repo)}/pulls/{int(number)}/reviews", json=payload)
+        except GitHubError as error:
+            if error.status_code == 422:
+                logger.warning("Inline review comments were rejected by GitHub.")
+                return False
+            raise
+        return True
+
+    # --- reading maintainer feedback -------------------------------------------
+    def list_commit_comments(self, repo: str, max_pages: int = 3) -> list[dict[str, Any]]:
+        return self._list(f"/repos/{validate_repo(repo)}/comments", max_pages=max_pages)
+
+    def list_repo_review_comments(self, repo: str, max_pages: int = 3) -> list[dict[str, Any]]:
+        return self._list(f"/repos/{validate_repo(repo)}/pulls/comments", params={"sort": "created", "direction": "desc"}, max_pages=max_pages)
+
+    def list_reactions(self, repo: str, kind: str, comment_id: int) -> list[dict[str, Any]]:
+        prefix = {"commit": "comments", "review": "pulls/comments", "issue": "issues/comments"}[kind]
+        return self._list(f"/repos/{validate_repo(repo)}/{prefix}/{int(comment_id)}/reactions", max_pages=2)
+
+    def repository_owner(self, repo: str) -> str:
+        return str((self._request("GET", f"/repos/{validate_repo(repo)}").get("owner") or {}).get("login", ""))
+
+    # --- helpers ---------------------------------------------------------------
+    def _list(self, path: str, params: dict[str, Any] | None = None, max_pages: int = 3) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            batch = self._request("GET", path, params={**(params or {}), "per_page": 100, "page": page})
+            items.extend(batch or [])
+            if not batch or len(batch) < 100:
+                break
+        return items
+
+    def _own_comment(self, comments: list[dict[str, Any]], marker: str) -> dict[str, Any] | None:
+        me = self.authenticated_login().lower()
+        for comment in comments:
+            author = str((comment.get("user") or {}).get("login", "")).lower()
+            if marker in str(comment.get("body", "")) and author == me:
+                return comment
+        return None
 
     def _require_token(self) -> None:
         if not self._has_token:

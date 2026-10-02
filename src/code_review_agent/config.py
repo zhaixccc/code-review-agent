@@ -41,10 +41,25 @@ class Settings:
     max_files_per_review: int = 30
     max_patch_chars_per_file: int = 24_000
     max_chunk_chars: int = 12_000
+    max_total_patch_chars: int = 160_000
+    max_commit_pages: int = 5
     llm_concurrency: int = 4
     review_language: str = "Simplified Chinese"
+    state_dir: Path = _PROJECT_ROOT / ".state"
+    # Hindsight long-term memory (disabled when hindsight_url is empty)
+    hindsight_url: str = ""
+    hindsight_api_key: str = field(default="", repr=False)
+    memory_recall_max_tokens: int = 1500
+    memory_timeout_seconds: int = 20
+    memory_conventions: tuple[str, ...] = ("AGENTS.md", "CONTRIBUTING.md", ".github/copilot-instructions.md", "docs/CONTRIBUTING.md")
+    memory_feedback_ttl_minutes: int = 30
+    trusted_feedback_users: tuple[str, ...] = ()
     host: str = "127.0.0.1"
     port: int = 8080
+
+    @property
+    def memory_enabled(self) -> bool:
+        return bool(self.hindsight_url)
 
     def require_llm(self) -> None:
         if not self.deepseek_api_key:
@@ -81,8 +96,18 @@ def load_settings() -> Settings:
         max_files_per_review=_int("MAX_FILES_PER_REVIEW", 30),
         max_patch_chars_per_file=_int("MAX_PATCH_CHARS_PER_FILE", 24_000, 1000),
         max_chunk_chars=_int("MAX_CHUNK_CHARS", 12_000, 1000),
+        max_total_patch_chars=_int("MAX_TOTAL_PATCH_CHARS", 160_000, 5000),
+        max_commit_pages=_int("MAX_COMMIT_PAGES", 5),
         llm_concurrency=_int("LLM_CONCURRENCY", 4),
         review_language=os.environ.get("REVIEW_LANGUAGE", "Simplified Chinese").strip()[:40] or "Simplified Chinese",
+        state_dir=Path(os.environ.get("STATE_DIR", "").strip() or _PROJECT_ROOT / ".state"),
+        hindsight_url=os.environ.get("HINDSIGHT_URL", "").strip().rstrip("/"),
+        hindsight_api_key=os.environ.get("HINDSIGHT_API_KEY", "").strip(),
+        memory_recall_max_tokens=_int("MEMORY_RECALL_MAX_TOKENS", 1500, 200),
+        memory_timeout_seconds=_int("MEMORY_TIMEOUT_SECONDS", 20),
+        memory_conventions=_csv("MEMORY_CONVENTION_FILES", "AGENTS.md,CONTRIBUTING.md,.github/copilot-instructions.md,docs/CONTRIBUTING.md"),
+        memory_feedback_ttl_minutes=_int("MEMORY_FEEDBACK_TTL_MINUTES", 30),
+        trusted_feedback_users=_csv("TRUSTED_FEEDBACK_USERS"),
         host=os.environ.get("HOST", "127.0.0.1").strip(),
         port=_int("PORT", 8080),
     )
