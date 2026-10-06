@@ -94,6 +94,7 @@ def render_report(
     impact_summary: list[str] | None = None,
     verify_dropped: int = 0,
     verify_downgraded: int = 0,
+    inline_omitted_count: int = 0,
 ) -> str:
     items = collect(file_reviews)
     counts = {severity: sum(1 for _, finding in items if finding.severity == severity) for severity in SEVERITY_ORDER}
@@ -124,6 +125,8 @@ def render_report(
         notes.append(f"参考了 {memory_used} 条项目记忆（Hindsight）")
     if verify_dropped or verify_downgraded:
         notes.append(f"二次验证：剔除 {verify_dropped} 条、降级 {verify_downgraded} 条未能证实的问题")
+    if inline_omitted_count:
+        notes.append(f"另有 {inline_omitted_count} 条问题未能作为行内评论发布，已保留在本汇总中")
     parts.append("---")
     parts.append("<sub>" + "；".join(sanitize(note) for note in notes) + f"。由 LangGraph + DeepSeek（{model}）自动生成，仅供参考，请人工复核。</sub>")
     return "\n\n".join(parts)

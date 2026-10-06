@@ -32,7 +32,7 @@ from langgraph.types import Send
 from .cache import ReviewCache
 from .config import Settings
 from .diff_utils import annotated_added_lines, annotate_patch, chunk_text, should_review, trim_patch
-from .github_client import GitHubClient, GitHubError
+from .github_client import GitHubClient, GitHubError, MAX_INLINE_REVIEW_COMMENTS
 from .impact import analyze_impact
 from .isolation import run_isolated
 from .llm import extract_json
@@ -421,7 +421,10 @@ def build_graph(
         target = ReviewTarget.model_validate(state["target"])
         reviews = _final_reviews(state)
 
-        def render(inline_keys: set[tuple[str, int]] | None = None) -> str:
+        def render(
+            inline_keys: set[tuple[str, int]] | None = None,
+            inline_omitted_count: int = 0,
+        ) -> str:
             return render_report(
                 sha=target.sha,
                 verdict=state.get("verdict", "comment"),
@@ -435,6 +438,7 @@ def build_graph(
                 impact_summary=state.get("impact_summary", []),
                 verify_dropped=int(state.get("verify_dropped", 0)),
                 verify_downgraded=int(state.get("verify_downgraded", 0)),
+                inline_omitted_count=inline_omitted_count,
             )
 
         if dry_run:
@@ -456,14 +460,31 @@ def build_graph(
                     return fingerprint_from_body(comment["body"]) in fingerprints or (comment["path"], comment["line"]) in anchors
 
                 fresh = [comment for comment in inline_all if not already(comment)]
-                posted_ok = True
-                if fresh:
-                    posted_ok = github.post_pull_request_review(
-                        target.repo, target.pr_number, target.sha, f"自动代码审查：新增 {len(fresh)} 条行内评论，汇总见 PR 评论。", fresh
-                    )
-                keys = {(c["path"], c["line"]) for c in inline_all if already(c) or (posted_ok and c in fresh)}
-                github.upsert_issue_comment(target.repo, target.pr_number, render(keys or None), MARKER)
-                return {"report": render(keys or None), "posted": True}
+                posted_inline: list[dict[str, Any]] = []
+                for offset in range(0, len(fresh), MAX_INLINE_REVIEW_COMMENTS):
+                    batch = fresh[offset : offset + MAX_INLINE_REVIEW_COMMENTS]
+                    try:
+                        posted = github.post_pull_request_review(
+                            target.repo,
+                            target.pr_number,
+                            target.sha,
+                            f"自动代码审查：本批新增 {len(batch)} 条行内评论，汇总见 PR 评论。",
+                            batch,
+                        )
+                    except GitHubError as error:
+                        logger.warning("Inline review batch failed (%s); retaining its findings in the summary.", error.status_code)
+                        posted = False
+                    if posted:
+                        posted_inline.extend(batch)
+                keys = {
+                    (c["path"], c["line"])
+                    for c in inline_all
+                    if already(c) or c in posted_inline
+                }
+                omitted_count = len(fresh) - len(posted_inline)
+                report = render(keys or None, omitted_count)
+                github.upsert_issue_comment(target.repo, target.pr_number, report, MARKER)
+                return {"report": report, "posted": True}
             report = render()
             github.upsert_commit_comment(target.repo, target.sha, report, MARKER)
             return {"report": report, "posted": True}

@@ -186,6 +186,61 @@ def test_pr_review_posts_inline_for_new_findings_and_a_summary_comment():
     assert "Bad anchor" in summary
 
 
+def test_pr_review_over_inline_limit_batches_comments_and_retains_rejected_findings():
+    class ManyFindingsLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if messages[0].content.startswith("You write a concise, evidence-based change-impact summary"):
+                return FakeMessage(json.dumps({
+                    "change": "Updates many files.",
+                    "scope": "51 source files.",
+                    "benefits": "Each file has a scoped change.",
+                    "risks": "Review all findings in the summary.",
+                    "fix_first": "Address the reported findings.",
+                }))
+            filename = messages[1].content.splitlines()[0].removeprefix("File: ")
+            return FakeMessage(json.dumps({"findings": [{
+                "severity": "minor",
+                "category": "bug",
+                "line": 1,
+                "title": f"Finding in {filename}",
+                "detail": "A distinct test finding.",
+            }]}))
+
+    files = [
+        ChangedFile(filename=f"src/demo_{index:02}.py", additions=1, patch=f"@@ -0,0 +1 @@\n+value = {index}\n")
+        for index in range(51)
+    ]
+    settings = Settings(
+        deepseek_api_key="k",
+        github_token="t",
+        github_webhook_secret="s" * 20,
+        max_files_per_review=60,
+        impact_enabled=False,
+        verify_findings=False,
+    )
+    for reject_inline in (False, True):
+        github = FakeGitHub(files=files)
+        github.reject_inline = reject_inline
+        graph = build_graph(settings, github, ManyFindingsLLM())
+        result = run_review(graph, ReviewTarget(repo="o/r", sha="f" * 40, pr_number=19), settings)
+
+        assert result["posted"] is True
+        summary = github.issue_comments[19]
+        if reject_inline:
+            assert github.reviews == []
+            assert "Finding in src/demo_00.py" in summary
+            assert "Finding in src/demo_50.py" in summary
+            assert "另有 51 条问题未能作为行内评论发布" in summary
+        else:
+            assert [len(review[4]) for review in github.reviews] == [50, 1]
+            assert "Finding in src/demo_50.py" not in summary
+            assert "行内评论上限" not in summary
+
+
 def test_pr_update_does_not_repeat_inline_comments_and_updates_the_summary():
     github = FakeGitHub()
     target = ReviewTarget(repo="o/r", sha="b" * 40, pr_number=7)

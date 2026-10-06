@@ -18,6 +18,7 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.@/-]{1,200}$")
 MAX_COMMENT_CHARS = 60_000
+MAX_INLINE_REVIEW_COMMENTS = 50
 MAX_FILE_BYTES = 200_000
 
 
@@ -169,8 +170,17 @@ class GitHubClient:
     def post_pull_request_review(self, repo: str, number: int, sha: str, body: str, inline: list[dict[str, Any]]) -> bool:
         """Post a COMMENT review with inline comments. Returns False if GitHub rejects the anchors (HTTP 422)."""
         self._require_token()
+        if len(inline) > MAX_INLINE_REVIEW_COMMENTS:
+            logger.warning(
+                "Inline review limit reached: sending %d of %d comment(s); caller must retain the rest in the summary.",
+                MAX_INLINE_REVIEW_COMMENTS,
+                len(inline),
+            )
         payload: dict[str, Any] = {
-            "commit_id": validate_sha(sha), "body": body[:MAX_COMMENT_CHARS], "event": "COMMENT", "comments": inline[:50],
+            "commit_id": validate_sha(sha),
+            "body": body[:MAX_COMMENT_CHARS],
+            "event": "COMMENT",
+            "comments": inline[:MAX_INLINE_REVIEW_COMMENTS],
         }
         try:
             self._request("POST", f"/repos/{validate_repo(repo)}/pulls/{int(number)}/reviews", json=payload)
