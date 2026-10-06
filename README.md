@@ -24,6 +24,12 @@ flowchart LR
    L --> END([END])
 ```
 
+**可单独查看 / 下载的详细流程图**（含 LangGraph `Send` 并行扇出、super-step 汇聚与状态节点）：
+
+![code-review-agent LangGraph 工作流](docs/agent-workflow.svg)
+
+[SVG 流程图](docs/agent-workflow.svg) · [PNG 预览](docs/agent-workflow.png) · [可编辑 Mermaid 源码（README 内）](README.md#工作流程) · [本地修改、推送与触发演示指南](docs/DEMO.md)
+
 ### 一次运行的 LangGraph 状态流
 
 图的入口只接收 `target`（仓库、commit SHA、可选 PR 编号）；`fetch_changes` 通过依赖注入的 GitHub client 取数据。后续每个节点返回**局部状态更新**，不是重新构造整份状态。
