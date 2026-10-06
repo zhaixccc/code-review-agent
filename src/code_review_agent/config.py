@@ -105,6 +105,9 @@ class Settings:
 
 def load_settings() -> Settings:
     load_dotenv(_PROJECT_ROOT / ".env")
+    requested_language = os.environ.get("REVIEW_LANGUAGE", "Simplified Chinese").strip()
+    if requested_language.casefold() not in {"simplified chinese", "简体中文"}:
+        raise ValueError("REVIEW_LANGUAGE 目前仅支持 Simplified Chinese（简体中文）。")
     return Settings(
         deepseek_api_key=os.environ.get("DEEPSEEK_API_KEY", "").strip(),
         deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/"),
@@ -121,8 +124,7 @@ def load_settings() -> Settings:
         max_total_patch_chars=_int("MAX_TOTAL_PATCH_CHARS", 160_000, 5000),
         max_commit_pages=_int("MAX_COMMIT_PAGES", 5),
         llm_concurrency=_int("LLM_CONCURRENCY", 4),
-        # GitHub findings and summaries are always rendered in Simplified Chinese.
-               review_language="Simplified Chinese",
+        review_language="Simplified Chinese",
         state_dir=Path(os.environ.get("STATE_DIR", "").strip() or _PROJECT_ROOT / ".state"),
         impact_enabled=_bool("IMPACT_ANALYSIS", True),
         impact_isolated=_bool("IMPACT_ISOLATED", True),
