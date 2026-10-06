@@ -121,8 +121,7 @@ def load_settings() -> Settings:
         max_total_patch_chars=_int("MAX_TOTAL_PATCH_CHARS", 160_000, 5000),
         max_commit_pages=_int("MAX_COMMIT_PAGES", 5),
         llm_concurrency=_int("LLM_CONCURRENCY", 4),
-        # GitHub review prose is intentionally fixed to Simplified Chinese for this repository.
-               # This repository's GitHub findings and summaries are always rendered in Simplified Chinese.
+        # GitHub findings and summaries are always rendered in Simplified Chinese.
                review_language="Simplified Chinese",
         state_dir=Path(os.environ.get("STATE_DIR", "").strip() or _PROJECT_ROOT / ".state"),
         impact_enabled=_bool("IMPACT_ANALYSIS", True),

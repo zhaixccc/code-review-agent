@@ -425,7 +425,7 @@ def build_graph(
         target = ReviewTarget.model_validate(state["target"])
         reviews = _final_reviews(state)
 
-        def render(
+        def build_report(
             inline_keys: set[tuple[str, int]] | None = None,
             inline_omitted_count: int = 0,
         ) -> str:
@@ -446,12 +446,12 @@ def build_graph(
             )
 
         if dry_run:
-            return {"report": render(), "posted": False}
+            return {"report": build_report(), "posted": False}
         if not reviews and state.get("errors"):
             # Every file failed: do not post a misleading "no issues" comment.
-            return {"report": render(), "posted": False, "errors": ["所有文件的审查都失败，未发布评论。"]}
+            return {"report": build_report(), "posted": False, "errors": ["所有文件的审查都失败，未发布评论。"]}
         if not reviews and not state.get("files"):
-            return {"report": render(), "posted": False}  # nothing reviewable in this change
+            return {"report": build_report(), "posted": False}  # nothing reviewable in this change
         try:
             if target.pr_number is not None:
                 me = github.authenticated_login()
@@ -486,15 +486,15 @@ def build_graph(
                     if already(c) or c in posted_inline
                 }
                 omitted_count = len(fresh) - len(posted_inline)
-                report = render(keys or None, omitted_count)
+                report = build_report(keys or None, omitted_count)
                 github.upsert_issue_comment(target.repo, target.pr_number, report, MARKER)
                 return {"report": report, "posted": True}
-            report = render()
+            report = build_report()
             github.upsert_commit_comment(target.repo, target.sha, report, MARKER)
             return {"report": report, "posted": True}
         except GitHubError as error:
             logger.error("Posting the review failed: %s", error)
-            return {"report": render(), "posted": False, "errors": [f"发布评论失败：{error}"]}
+            return {"report": build_report(), "posted": False, "errors": [f"发布评论失败：{error}"]}
 
     def learn(state: ReviewState) -> dict[str, Any]:
         if memory is None or dry_run:

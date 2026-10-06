@@ -63,6 +63,7 @@ def test_uncertain_findings_are_downgraded_and_confirmed_ones_are_kept():
     assert "**[P0 · 紧急/缺陷]** Always crashes" in body  # untouched
     assert "**[P3 · 提示/缺陷]** Small thing" in body  # uncertain minor -> lowest priority
     assert len(verify_calls(llm)) == 3
+    assert any(entry["title"] == "Small thing" and entry["verdict"] == "uncertain" for entry in result["verify_log"])
     assert result["verdict"] == "request_changes"
 
 
