@@ -2,16 +2,55 @@
 
 基于 **LangGraph + DeepSeek API** 的 GitHub 自动代码审查 Agent：有新的 push（或 Pull Request）时，自动审查改动并把结果评论回 GitHub。
 
+> 想了解它是怎么设计的、用了哪些技术原理，以及 LangGraph 的原理与用法，见 [docs/DESIGN.md](docs/DESIGN.md)。
+
 ## 工作流程
 
+```mermaid
+flowchart LR
+   GH[GitHub push / pull_request] --> WH[FastAPI Webhook<br/>HMAC 校验 · 过滤 · 去重]
+   WH --> BG[后台任务与并发信号量]
+   BG --> F[fetch_changes]
+   F --> T[triage<br/>风险排序 · 预算选择 · 确定性密钥发现]
+   T --> I[impact_analysis<br/>提交快照 · tree-sitter · 调用方证据]
+   I --> M[recall_memory<br/>可选 Hindsight]
+   M --> D{dispatch<br/>LangGraph conditional edge}
+   D -->|每个入选文件一个 Send| RF[review_file × N<br/>并行 · DeepSeek]
+   D -->|没有可审查文件| V[verify]
+   RF -->|super-step 汇聚| V
+   V --> S[synthesize<br/>合并 findings · 代码推导 verdict]
+   S --> P[publish<br/>dry-run 或 GitHub 评论 upsert]
+   P --> L[learn<br/>可选 · dry-run 跳过]
+   L --> END([END])
 ```
-GitHub webhook ──► 验证签名 / 过滤事件 ──► LangGraph
-                                            │
- fetch_changes ─► triage ─► impact_analysis ─► recall_memory ─┬─► review_file（每个文件并行，DeepSeek）─┐
-                                                            └───（无可审查文件）───────────┤
-                                                                                    ▼
-                                          verify ─► synthesize ─► publish ─► learn
-```
+
+### 一次运行的 LangGraph 状态流
+
+图的入口只接收 `target`（仓库、commit SHA、可选 PR 编号）；`fetch_changes` 通过依赖注入的 GitHub client 取数据。后续每个节点返回**局部状态更新**，不是重新构造整份状态。
+
+| 阶段 | 读取 → 写入 | 图控制 / 失败行为 |
+|---|---|---|
+| `fetch_changes` | `target` → `commit_message`、`files`、`changed_paths` | GitHub API 分页；commit message 先脱敏。`changed_paths` 保留全部改动路径，供影响分析判定调用方文件是否也被改动 |
+| `triage` | `files` → 预算内候选 `files`、`skipped`、可选 `file_reviews` | 敏感文件由规则直接产生 finding、绝不送模型；其余文件按风险和字符预算排序。安全规则 finding 通过追加型 `file_reviews` 进入下游 |
+| `impact_analysis` | `target`、候选文件、原始 `changed_paths` → `impact`、`impact_summary` | 可关闭；下载或解析失败时优雅降级为空证据。tree-sitter 默认在隔离子进程运行 |
+| `recall_memory` | 仓库、候选路径、commit message → `memory`、`memory_count` | Hindsight 可选；不可用不阻断审查，召回内容作为不可信背景 |
+| `dispatch` | 候选文件 + 共用上下文 → `Send("review_file", FileTask)` 列表 | 条件边动态扇出；无候选文件则直接路由到 `verify`，不创建空的模型任务 |
+| `review_file × N` | 单文件 diff + 对应影响证据 → `file_reviews`、`errors` | 同一 super-step 并行；每个任务只拿本文件所需 payload。两字段使用 `operator.add` reducer 汇总并发写入 |
+| `verify` | `file_reviews` → `verified_reviews`、`verify_log` | 只验证模型产生的 major/critical；反驳则删除，不确定则降级，失败保留原发现。写入独立覆盖键，避免追加 reducer 把新列表再拼到旧列表 |
+| `synthesize` | `_final_reviews(state)` → `verdict`、`summary` | `_final_reviews` 优先取 `verified_reviews`，否则取 `file_reviews`；严重度到结论由代码确定，模型只写摘要 |
+| `publish` | 最终 reviews 与目标 → `report`、`posted` | `dry_run` 只渲染；GitHub 发布执行 upsert 与评论去重；全部文件调用失败时不发布误导性的“无问题” |
+| `learn` | 仓库与可信反馈 → Hindsight 记忆 | 可选；dry-run 跳过；失败不影响审查结果 |
+
+#### LangGraph 的关键机制
+
+1. **StateGraph + TypedDict**：`ReviewState` 是图的共享状态 schema。节点只返回本阶段变更的字段；节点之间通过状态而不是共享可变对象传递结果。
+2. **Conditional edge + Send 动态扇出**：`recall_memory` 后的 `dispatch` 为每个候选文件返回一个 `Send`，由 LangGraph 把多个 `review_file` 任务放在同一个 super-step 并行执行；全部结束后再进入 `verify`（扇入）。
+3. **Reducer 定义并发合并语义**：`file_reviews`、`errors` 标注 `operator.add`，同一 super-step 的多个分支可以安全追加结果；无 reducer 的字段使用覆盖语义。
+4. **为什么验证结果用另一个 state key**：`file_reviews` 是追加 reducer。若 `verify` 把过滤后的完整列表写回同一 key，结果会追加到原列表，而非替换，因此改写到 `verified_reviews`；下游统一通过 `_final_reviews()` 选择最终版本。
+5. **依赖注入**：GitHub、LLM、快照、Hindsight、缓存都从 `build_graph()` 注入；单元测试用 fake 实现替换，不需要真实网络或密钥。
+6. **并发上限**：`graph.invoke(..., config={"max_concurrency": settings.llm_concurrency})` 限制图级并发；Webhook 外层还有全局 review semaphore，分别控制单次图内 LLM 并发和服务同时处理的 review 数。
+
+节点实现与 LangGraph 原理详解（State、Node、Edge、super-step、reducer、Send、checkpoint、容错）见 [docs/DESIGN.md](docs/DESIGN.md) 第 3–5、15–25 节。
 
 | 节点 | 作用 |
 |---|---|
