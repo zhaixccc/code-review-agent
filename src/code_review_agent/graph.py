@@ -31,7 +31,7 @@ from langgraph.types import Send
 
 from .cache import ReviewCache
 from .config import Settings
-from .diff_utils import annotated_added_lines, annotate_patch, chunk_text, should_review, trim_patch
+from .diff_utils import chunk_text, prepare_review_patch, should_review, trim_patch
 from .github_client import GitHubClient, GitHubError, MAX_INLINE_REVIEW_COMMENTS
 from .impact import analyze_impact
 from .isolation import run_isolated
@@ -266,11 +266,14 @@ def build_graph(
 
     def review_file(task: FileTask) -> dict[str, Any]:
         file = ChangedFile.model_validate(task["file"])
-        # Annotate the full diff once so deterministic checks see every line; then trim that annotated form for the model.
-        full_annotated, full_valid_lines = annotate_patch(file.patch or "")
-        annotated, omitted_hunks = trim_patch(full_annotated, settings.max_patch_chars_per_file)
-        truncated = omitted_hunks > 0 or len(annotated) < len(full_annotated)
-        model_valid_lines = annotated_added_lines(annotated)
+        (
+            annotated,
+            omitted_hunks,
+            full_valid_lines,
+            model_valid_lines,
+            truncated,
+            full_annotated,
+        ) = prepare_review_patch(file.patch or "", settings.max_patch_chars_per_file)
 
         # Deterministic secret findings cover all added lines; the model only ever sees the trimmed, redacted text.
         deterministic: list[Finding] = []

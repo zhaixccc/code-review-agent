@@ -70,6 +70,25 @@ def annotated_added_lines(patch: str) -> set[int]:
     }
 
 
+def prepare_review_patch(patch: str, max_chars: int) -> tuple[str, int, set[int], set[int], bool, str]:
+    """Annotate once, then trim only complete hunks/lines for the model.
+
+    Returns (model-visible annotated patch, omitted hunk count, all added line numbers,
+    model-visible added line numbers, truncated, full annotated patch). Because trimming
+    operates on the annotated text by hunk and line boundaries, it preserves line-number prefixes.
+    """
+    full_annotated, all_added_lines = annotate_patch(patch)
+    model_patch, omitted_hunks = trim_patch(full_annotated, max_chars)
+    return (
+        model_patch,
+        omitted_hunks,
+        all_added_lines,
+        annotated_added_lines(model_patch),
+        model_patch != full_annotated,
+        full_annotated,
+    )
+
+
 def changed_new_lines(patch: str) -> tuple[set[int], set[tuple[int, int]]]:
     """(added new-file lines, deletion gaps).
 

@@ -129,7 +129,7 @@ def render_report(
             priority: sum(1 for _, finding in items if priority_for(finding.severity) == priority)
             for priority in PRIORITY_ORDER
         }
-        parts.append("**处置优先级：** " + " · ".join(f"{priority} {count}" for priority, count in priority_counts.items() if count))
+        parts.append("**处置优先级（含行内评论）：** " + " · ".join(f"{priority} {count}" for priority, count in priority_counts.items() if count))
         parts.append("### 发现的问题")
         for priority in PRIORITY_ORDER:
             group = [(path, finding) for path, finding in items if priority_for(finding.severity) == priority]

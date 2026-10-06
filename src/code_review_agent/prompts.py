@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROMPT_VERSION = "7"  # bump when prompts change so cached model results are not reused
+PROMPT_VERSION = "8"  # bump when prompts change so cached model results are not reused
 
 FILE_REVIEW_SYSTEM = """You are a senior software engineer reviewing ONE file of a code change.
 
@@ -43,6 +43,12 @@ Rules:
   existing test/guard covers it.
 - For a cross-file/API compatibility claim, cite the exact changed declaration and an actual incompatible caller
   from <impact_evidence>. If that evidence is absent or ambiguous, do not infer breakage from unseen files.
+- Respect lexical scope: a nested function/closure is only callable inside its enclosing function unless it is
+  explicitly returned or passed elsewhere. A same-named method call such as `obj.render()` is not evidence that it
+  invokes a local closure; require a concrete binding/call path before reporting it.
+- Do not claim that a helper, setting, template placeholder, or test fixture is undefined merely because its
+  unchanged definition is outside the supplied diff. Report a missing cross-file update only when the supplied
+  caller evidence demonstrates the mismatch.
 - Report one finding per root cause; merge duplicates across chunks and avoid restating the same concern as both
   a bug and a testing nit. Performance findings require a measured regression or a clearly superlinear resource
   impact on a stated input scale; avoid speculative micro-optimizations.

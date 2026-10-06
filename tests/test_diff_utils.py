@@ -1,6 +1,6 @@
 import pytest
 
-from code_review_agent.diff_utils import annotated_added_lines, annotate_patch, chunk_text, should_review
+from code_review_agent.diff_utils import annotated_added_lines, annotate_patch, chunk_text, prepare_review_patch, should_review
 
 PATCH = """@@ -1,4 +1,6 @@
  import os
@@ -43,6 +43,17 @@ def test_annotated_added_lines_handles_empty_and_non_added_rows():
 def test_annotated_added_lines_does_not_confuse_code_text_with_the_anchor():
     annotated = "    5 + 123 + this is code\n    6   123 + this is context\n"
     assert annotated_added_lines(annotated) == {5}
+
+
+def test_prepare_review_patch_keeps_whole_annotated_lines_and_separate_anchors():
+    raw = "@@ -0,0 +1,3 @@\n+first = 1\n+middle = 2\n+last = 3\n"
+    model_patch, omitted, all_lines, visible_lines, truncated, full_patch = prepare_review_patch(raw, 55)
+    assert truncated is True
+    assert omitted == 0  # a single oversized hunk is cut at a line boundary
+    assert all_lines == {1, 2, 3}
+    assert visible_lines <= all_lines and visible_lines
+    assert "middle = 2" in full_patch
+    assert all(" + " in line for line in model_patch.splitlines() if line and not line.startswith("@@"))
 
 
 @pytest.mark.parametrize(
