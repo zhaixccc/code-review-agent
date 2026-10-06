@@ -258,6 +258,37 @@ def test_secrets_inside_normal_files_are_redacted_before_the_model_and_reported_
     assert "ghp_a1B2" not in body
 
 
+def test_secrets_in_omitted_diff_hunks_are_still_scanned():
+    token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    patch = (
+        "@@ -0,0 +1 @@\n+first = 1\n"
+        "@@ -49,0 +50,2 @@\n"
+        f"+token = '{token}'\n"
+        f"+padding = '{'x' * 200}'\n"
+        "@@ -99,0 +100 @@\n+last = 1\n"
+    )
+    settings = Settings(
+        deepseek_api_key="k",
+        github_token="t",
+        github_webhook_secret="s" * 20,
+        max_patch_chars_per_file=100,
+        impact_enabled=False,
+        verify_findings=False,
+    )
+    github = FakeGitHub(files=[ChangedFile(filename="src/config.py", additions=4, patch=patch)])
+    llm = FakeLLM('{"findings": []}')
+    graph = build_graph(settings, github, llm)
+    result = run_review(graph, ReviewTarget(repo="o/r", sha="d" * 40), settings)
+
+    sent = "\n".join(message.content for call in llm.calls for message in call)
+    body = github.commit_comments["d" * 40]
+    secret_findings = [item for item in result["file_reviews"][0]["findings"] if item["origin"] == "rule"]
+    assert "diff truncated" in sent
+    assert token not in sent and token not in body
+    assert any(item["line"] == 50 and "GitHub Token" in item["title"] for item in secret_findings)
+    assert "`src/config.py:50`" in body
+
+
 def test_secrets_in_the_commit_message_are_redacted():
     class LeakyGitHub(FakeGitHub):
         def get_commit(self, repo, sha, max_pages=5):

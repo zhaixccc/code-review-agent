@@ -217,14 +217,16 @@ def build_graph(
 
     def review_file(task: FileTask) -> dict[str, Any]:
         file = ChangedFile.model_validate(task["file"])
+        # Secret scanning must cover the complete diff; model input is trimmed separately for budget control.
+        full_annotated, full_valid_lines = annotate_patch(file.patch or "")
         trimmed, omitted_hunks = trim_patch(file.patch or "", settings.max_patch_chars_per_file)
         truncated = omitted_hunks > 0 or len(trimmed) < len(file.patch or "")
-        annotated, valid_lines = annotate_patch(trimmed)
+        annotated, model_valid_lines = annotate_patch(trimmed)
 
-        # Deterministic secret findings come from the raw text; the model only ever sees the redacted text.
+        # Deterministic secret findings cover all added lines; the model only ever sees the trimmed, redacted text.
         deterministic: list[Finding] = []
         seen_secrets: set[tuple[int, str]] = set()
-        for line, kind in scan_added_lines(annotated):
+        for line, kind in scan_added_lines(full_annotated):
             if (line, kind) not in seen_secrets and len(deterministic) < MAX_SECRET_FINDINGS_PER_FILE:
                 seen_secrets.add((line, kind))
                 deterministic.append(secret_finding(kind, line))
@@ -283,7 +285,8 @@ def build_graph(
         seen: set[tuple[int | None, str]] = set()
         cleaned: list[Finding] = []
         for finding in findings:
-            if finding.line is not None and finding.line not in valid_lines:
+            allowed_lines = full_valid_lines if finding.origin == "rule" else model_valid_lines
+            if finding.line is not None and finding.line not in allowed_lines:
                 finding = finding.model_copy(update={"line": None})
             key = (finding.line, finding.title.strip().lower())
             if key not in seen:
@@ -292,7 +295,7 @@ def build_graph(
         review = FileReview(
             filename=file.filename,
             findings=cleaned[:MAX_FINDINGS_PER_FILE],
-            valid_lines=sorted(valid_lines),
+            valid_lines=sorted(full_valid_lines),
             truncated=truncated,
         )
         update: dict[str, Any] = {"errors": errors}
