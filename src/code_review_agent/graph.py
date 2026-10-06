@@ -19,6 +19,7 @@ fetch_changes -> triage -> impact_analysis -> recall_memory -> (fan out: one rev
 
 from __future__ import annotations
 
+import json
 import logging
 import operator
 from typing import Annotated, Any, TypedDict
@@ -30,7 +31,7 @@ from langgraph.types import Send
 
 from .cache import ReviewCache
 from .config import Settings
-from .diff_utils import annotate_patch, chunk_text, should_review, trim_patch
+from .diff_utils import annotated_added_lines, annotate_patch, chunk_text, should_review, trim_patch
 from .github_client import GitHubClient, GitHubError
 from .impact import analyze_impact
 from .isolation import run_isolated
@@ -66,6 +67,44 @@ MAX_FINDINGS_PER_CHUNK = 8
 MAX_FINDINGS_PER_FILE = 12
 MAX_SECRET_FINDINGS_PER_FILE = 5
 MAX_MESSAGE_CHARS = 2000
+MAX_SUMMARY_CONTEXT_CHARS = 12_000
+MAX_SUMMARY_DIFF_CHARS_PER_FILE = 1_800
+
+
+def _summary_context(state: ReviewState) -> str:
+    """Build a bounded, redacted JSON context for the change-impact summary call."""
+    data: dict[str, Any] = {
+        "impact_summary": [redact(str(item))[0][:400] for item in state.get("impact_summary", [])[:8]],
+        "skipped": [str(item)[:180] for item in state.get("skipped", [])[:12]],
+        "files": [],
+    }
+
+    def encode(value: Any) -> str:
+        # Prevent untrusted diff text from closing the surrounding prompt tag.
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+    for raw in state.get("files", []):
+        file = ChangedFile.model_validate(raw)
+        impact = redact(str((state.get("impact") or {}).get(file.filename, "")))[0][:1200]
+        base = {
+            "path": file.filename[:240],
+            "additions": file.additions,
+            "deletions": file.deletions,
+            "impact_evidence": impact,
+        }
+        remaining = MAX_SUMMARY_CONTEXT_CHARS - len(encode(data)) - len(encode(base)) - 160
+        if remaining <= 0:
+            break
+        patch, _ = redact(file.patch or "")
+        patch_budget = min(MAX_SUMMARY_DIFF_CHARS_PER_FILE, remaining)
+        excerpt, omitted_hunks = trim_patch(patch, patch_budget)
+        entry = {**base, "diff_excerpt": excerpt, "omitted_hunks": omitted_hunks}
+        candidate = {**data, "files": [*data["files"], entry]}
+        if len(encode(candidate)) > MAX_SUMMARY_CONTEXT_CHARS:
+            break
+        data["files"].append(entry)
+
+    return encode(data)
 
 
 class ReviewState(TypedDict, total=False):
@@ -217,11 +256,11 @@ def build_graph(
 
     def review_file(task: FileTask) -> dict[str, Any]:
         file = ChangedFile.model_validate(task["file"])
-        # Secret scanning must cover the complete diff; model input is trimmed separately for budget control.
+        # Annotate the full diff once so deterministic checks see every line; then trim that annotated form for the model.
         full_annotated, full_valid_lines = annotate_patch(file.patch or "")
-        trimmed, omitted_hunks = trim_patch(file.patch or "", settings.max_patch_chars_per_file)
-        truncated = omitted_hunks > 0 or len(trimmed) < len(file.patch or "")
-        annotated, model_valid_lines = annotate_patch(trimmed)
+        annotated, omitted_hunks = trim_patch(full_annotated, settings.max_patch_chars_per_file)
+        truncated = omitted_hunks > 0 or len(annotated) < len(full_annotated)
+        model_valid_lines = annotated_added_lines(annotated)
 
         # Deterministic secret findings cover all added lines; the model only ever sees the trimmed, redacted text.
         deterministic: list[Finding] = []
@@ -281,11 +320,14 @@ def build_graph(
             cache.put(cache_key, [finding.model_dump() for finding in model_findings])
         findings: list[Finding] = [*deterministic, *model_findings]
 
-        # Only keep line anchors that really exist on added lines; otherwise report without a line.
+        # Only keep line anchors that really exist on added lines; model findings must also be visible to the model.
         seen: set[tuple[int | None, str]] = set()
         cleaned: list[Finding] = []
-        for finding in findings:
-            allowed_lines = full_valid_lines if finding.origin == "rule" else model_valid_lines
+        findings_with_anchors = [
+            *((finding, full_valid_lines) for finding in deterministic),
+            *((finding, model_valid_lines) for finding in model_findings),
+        ]
+        for finding, allowed_lines in findings_with_anchors:
             if finding.line is not None and finding.line not in allowed_lines:
                 finding = finding.model_copy(update={"line": None})
             key = (finding.line, finding.title.strip().lower())
@@ -333,17 +375,37 @@ def build_graph(
         findings = [finding for _, finding in items]
         verdict = verdict_for(findings)
         summary = ""
-        if findings:
-            payload = "\n".join(f"- [{f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}" for path, f in items[:40])
+        files = state.get("files", [])
+        errors = state.get("errors", [])
+        if files and (findings or not errors):
+            payload = "\n".join(
+                f"- [{f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}: {f.detail[:400]}"
+                for path, f in items[:40]
+            ) or "（没有发现需要报告的问题）"
             try:
                 response = llm.invoke(
                     [
                         SystemMessage(content=SUMMARY_SYSTEM.format(language=settings.review_language)),
-                        HumanMessage(content=SUMMARY_USER.format(message=state.get("commit_message", ""), findings=payload)),
+                        HumanMessage(content=SUMMARY_USER.format(
+                            message=state.get("commit_message", ""),
+                            change_context=_summary_context(state),
+                            findings=payload,
+                        )),
                     ]
                 )
                 data = extract_json(response.content) or {}
-                summary = str(data.get("summary", ""))[:1500]
+                sections = (
+                    ("变更概述", data.get("change")),
+                    ("影响范围", data.get("scope")),
+                    ("正向影响", data.get("benefits")),
+                    ("风险与负向影响", data.get("risks")),
+                    ("优先处理", data.get("fix_first")),
+                )
+                summary = "\n\n".join(
+                    f"### {title}\n{str(value).strip()[:700]}"
+                    for title, value in sections
+                    if isinstance(value, str) and value.strip()
+                )[:3500]
             except Exception as error:
                 logger.warning("Summary request failed: %s", type(error).__name__)
         return {"verdict": verdict, "summary": summary}

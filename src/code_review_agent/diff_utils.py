@@ -6,6 +6,7 @@ import re
 from pathlib import PurePosixPath
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_ANNOTATED_ADDED_RE = re.compile(r"^\s*(\d+) \+ ")
 
 _SKIP_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".pdf", ".zip", ".gz", ".tar", ".7z",
@@ -58,6 +59,15 @@ def annotate_patch(patch: str) -> tuple[str, set[int]]:
             output.append(f"{new_line:>5}   {raw[1:]}")
             new_line += 1
     return "\n".join(output), added
+
+
+def annotated_added_lines(patch: str) -> set[int]:
+    """Return the real new-file line numbers of added lines in an annotated patch."""
+    return {
+        int(match.group(1))
+        for raw in patch.splitlines()
+        if (match := _ANNOTATED_ADDED_RE.match(raw)) is not None
+    }
 
 
 def changed_new_lines(patch: str) -> tuple[set[int], set[tuple[int, int]]]:

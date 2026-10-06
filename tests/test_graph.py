@@ -20,11 +20,18 @@ class FakeMessage:
 
 
 class FakeLLM:
-    def __init__(self, finding_json=None, fail=False, verdicts=None):
+    def __init__(self, finding_json=None, fail=False, verdicts=None, summary_json=None):
         self.calls = []
         self.finding_json = finding_json
         self.fail = fail
         self.verdicts = verdicts or {}  # finding title -> verdict for verification calls
+        self.summary_json = summary_json or json.dumps({
+            "change": "Adds logging.",
+            "scope": "src/app.py and its callers.",
+            "benefits": "The new log can help diagnose failures. @octocat",
+            "risks": "The diff does not establish whether the log contains sensitive data. ![x](http://evil/x.png)",
+            "fix_first": "Review the logging content.",
+        })
 
     def invoke(self, messages):
         self.calls.append(messages)
@@ -33,8 +40,8 @@ class FakeLLM:
         if messages[0].content.startswith("You are a skeptical senior reviewer"):
             title = next((line[7:] for line in messages[1].content.splitlines() if line.startswith("title: ")), "")
             return FakeMessage(json.dumps({"verdict": self.verdicts.get(title, "confirmed"), "reason": "checked"}))
-        if messages[0].content.startswith("You write the overall summary"):
-            return FakeMessage(json.dumps({"summary": "Adds logging. See @octocat ![x](http://evil/x.png)"}))
+        if messages[0].content.startswith("You write a concise, evidence-based change-impact summary"):
+            return FakeMessage(self.summary_json)
         return FakeMessage(
             self.finding_json
             or json.dumps(
@@ -147,6 +154,7 @@ def test_commit_review_posts_sanitised_comment_and_drops_invalid_anchors():
     assert "Bad anchor" in body and "`src/app.py:999`" not in body  # anchor outside the diff is removed
     assert "dropped" not in body  # finding with an invalid severity is discarded
     assert "@octocat" not in body and "![x]" not in body  # mentions and images are neutralised
+    assert all(section in body for section in ("### 变更概述", "### 影响范围", "### 正向影响", "### 风险与负向影响", "### 优先处理"))
     assert "package-lock.json" in body  # reported as skipped
     assert len(llm.calls) == 2  # one source file + one summary call
     assert github.commit_page_arg == SETTINGS.max_commit_pages
@@ -206,6 +214,31 @@ def test_no_findings_reports_clean_review():
     result = run(FakeLLM('{"findings": []}'), github)
     assert result["verdict"] == "approve"
     assert "没有发现需要报告的问题" in github.commit_comments["a" * 40]
+    assert "### 正向影响" in github.commit_comments["a" * 40]
+
+
+def test_summary_explains_change_scope_benefits_and_risks_from_redacted_context():
+    token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    patch = "@@ -1,1 +1,2 @@\n+def feature():\n+    return 'token=" + token + "'\n"
+    github = FakeGitHub(files=[ChangedFile(filename="src/feature.py", additions=2, patch=patch)])
+    summary = json.dumps({
+        "change": "Adds a feature that reads the configured value.",
+        "scope": "src/feature.py; no callers were identified in the supplied context.",
+        "benefits": "The feature makes the value available to the caller.",
+        "risks": "The added hard-coded credential is a security risk.",
+        "fix_first": "Remove and rotate the credential.",
+    })
+    llm = FakeLLM('{"findings": []}', summary_json=summary)
+    run(llm, github)
+
+    summary_user = next(messages[1].content for messages in llm.calls if messages[0].content.startswith("You write a concise"))
+    report = github.commit_comments["a" * 40]
+    assert "src/feature.py" in summary_user and "a1B2" not in summary_user
+    assert "### 变更概述" in report and "configured value" in report
+    assert "### 影响范围" in report and "src/feature.py" in report
+    assert "### 正向影响" in report and "available to the caller" in report
+    assert "### 风险与负向影响" in report and "hard-coded credential" in report
+    assert "### 优先处理" in report and "Remove and rotate" in report
 
 
 def test_all_llm_failures_do_not_post_a_misleading_comment():

@@ -1,6 +1,6 @@
 import pytest
 
-from code_review_agent.diff_utils import annotate_patch, chunk_text, should_review
+from code_review_agent.diff_utils import annotated_added_lines, annotate_patch, chunk_text, should_review
 
 PATCH = """@@ -1,4 +1,6 @@
  import os
@@ -28,6 +28,11 @@ def test_annotate_patch_ignores_no_newline_marker():
     text, added = annotate_patch("@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n")
     assert added == {1}
     assert "No newline" not in text
+
+
+def test_annotated_added_lines_extracts_only_added_line_anchors():
+    annotated, _ = annotate_patch(PATCH)
+    assert annotated_added_lines(annotated) == {2, 3, 23}
 
 
 @pytest.mark.parametrize(
