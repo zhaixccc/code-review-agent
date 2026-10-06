@@ -21,6 +21,13 @@ VERDICT_TEXT = {
     "comment": "有若干建议，请作者评估",
     "approve": "未发现明显问题",
 }
+PRIORITY_BY_SEVERITY = {"critical": "P0", "major": "P1", "minor": "P2", "nit": "P3"}
+PRIORITY_ORDER = ("P0", "P1", "P2", "P3")
+
+
+def priority_for(severity: str) -> str:
+    """Map review severity to an explicit triage priority for humans."""
+    return PRIORITY_BY_SEVERITY.get(severity, "P3")
 
 
 def sanitize(text: str) -> str:
@@ -44,7 +51,7 @@ def collect(file_reviews: list[FileReview]) -> list[tuple[str, Finding]]:
 
 def render_finding(path: str, finding: Finding, with_location: bool = True) -> str:
     location = f"`{path}:{finding.line}`" if finding.line else f"`{path}`"
-    head = f"**[{finding.severity}/{finding.category}]** {sanitize(finding.title)}"
+    head = f"**[{priority_for(finding.severity)} · {finding.severity}/{finding.category}]** {sanitize(finding.title)}"
     lines = [f"- {head}" + (f" — {location}" if with_location else "")]
     lines.append(f"  {sanitize(finding.detail)}")
     if finding.suggestion:
@@ -105,12 +112,27 @@ def render_report(
         parts.append("### 影响面\n" + "\n".join(f"- {sanitize(line)}" for line in impact_summary))
     if items:
         parts.append("**问题统计：** " + " · ".join(f"{name} {count}" for name, count in counts.items() if count))
+        priority_counts = {
+            priority: sum(1 for _, finding in items if priority_for(finding.severity) == priority)
+            for priority in PRIORITY_ORDER
+        }
+        parts.append("**处置优先级：** " + " · ".join(f"{priority} {count}" for priority, count in priority_counts.items() if count))
         parts.append("### 发现的问题")
-        for path, finding in items:
-            anchored_inline = inline_paths is not None and finding.line is not None and (path, finding.line) in inline_paths
-            if anchored_inline:
+        rendered_inline = False
+        for priority in PRIORITY_ORDER:
+            group = [(path, finding) for path, finding in items if priority_for(finding.severity) == priority]
+            visible = [
+                (path, finding)
+                for path, finding in group
+                if inline_paths is None or finding.line is None or (path, finding.line) not in inline_paths
+            ]
+            if not visible:
+                rendered_inline = rendered_inline or bool(group)
                 continue
-            parts.append(render_finding(path, finding))
+            parts.append(f"#### {priority}")
+            parts.extend(render_finding(path, finding) for path, finding in visible)
+        if rendered_inline:
+            parts.append("_部分高优先级问题已作为行内评论发布。P3 nit 仅列于汇总，避免行内评论噪声。_")
         if inline_paths and any(finding.line and (path, finding.line) in inline_paths for path, finding in items):
             parts.append("_部分问题已作为行内评论发布。_")
     else:
@@ -138,8 +160,11 @@ def build_inline_comments(file_reviews: list[FileReview]) -> list[dict[str, Any]
     for review in file_reviews:
         valid = set(review.valid_lines)
         for finding in review.findings:
+            # Nits remain visible in the priority-grouped summary, but do not create noisy inline threads.
+            if finding.severity == "nit":
+                continue
             if finding.line and finding.line in valid:
-                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{finding.severity}/{finding.category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
+                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{priority_for(finding.severity)} · {finding.severity}/{finding.category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
                 if finding.suggestion:
                     body += f"\n\n建议：{sanitize(finding.suggestion)}"
                 comments.append({"path": review.filename, "line": finding.line, "side": "RIGHT", "body": body})

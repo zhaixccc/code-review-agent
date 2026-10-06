@@ -55,14 +55,31 @@ def test_refuted_findings_are_dropped_and_the_verdict_follows():
 
 def test_uncertain_findings_are_downgraded_and_confirmed_ones_are_kept():
     settings = Settings(**BASE, verify_findings=True)
-    llm = FakeLLM(finding_json=TWO_FINDINGS, verdicts={"Secret printed": "uncertain", "Always crashes": "confirmed"})
+    llm = FakeLLM(finding_json=TWO_FINDINGS, verdicts={"Secret printed": "uncertain", "Always crashes": "confirmed", "Small thing": "uncertain"})
     result = run(llm, FakeGitHub(), settings)
     body = result["report"]
-    assert result["verify_downgraded"] == 1 and result["verify_dropped"] == 0
-    assert "[minor/security]** Secret printed" in body  # major -> minor
-    assert "[critical/bug]** Always crashes" in body  # untouched
-    assert len(verify_calls(llm)) == 2  # the minor finding is not worth a verification call
+    assert result["verify_downgraded"] == 2 and result["verify_dropped"] == 0
+    assert "**[P2 · minor/security]** Secret printed" in body  # major -> minor
+    assert "**[P0 · critical/bug]** Always crashes" in body  # untouched
+    assert "**[P3 · nit/bug]** Small thing" in body  # uncertain minor -> lowest priority
+    assert len(verify_calls(llm)) == 3
     assert result["verdict"] == "request_changes"
+
+
+def test_uncertain_minor_finding_is_downgraded_to_p3_and_kept_in_summary_only():
+    only_minor = json.dumps({"findings": [{
+        "severity": "minor", "category": "bug", "line": 3, "title": "Edge case", "detail": "Trigger is not established."
+    }]})
+    llm = FakeLLM(finding_json=only_minor, verdicts={"Edge case": "uncertain"})
+    github = FakeGitHub()
+    settings = Settings(**BASE, verify_findings=True)
+    graph = build_graph(settings, github, llm)
+    result = run_review(graph, ReviewTarget(repo="o/r", sha="b" * 40, pr_number=8), settings)
+
+    assert result["verify_downgraded"] == 1
+    assert "**[P3 · nit/bug]** Edge case" in result["report"]
+    assert github.reviews == []
+    assert "Edge case" in github.issue_comments[8]
 
 
 def test_verification_failures_keep_the_finding():
@@ -74,7 +91,7 @@ def test_verification_failures_keep_the_finding():
 
     settings = Settings(**BASE, verify_findings=True)
     result = run(FlakyVerifier(finding_json=TWO_FINDINGS), FakeGitHub(), settings)
-    assert "[major/security]** Secret printed" in result["report"] and result["verify_dropped"] == 0
+    assert "**[P1 · major/security]** Secret printed" in result["report"] and result["verify_dropped"] == 0
     assert all(entry["verdict"] == "unverified" for entry in result["verify_log"])
 
 

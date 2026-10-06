@@ -54,6 +54,7 @@ from .report import (
     collect,
     existing_fingerprints,
     fingerprint_from_body,
+    priority_for,
     render_report,
     verdict_for,
 )
@@ -386,7 +387,7 @@ def build_graph(
         # This summary call intentionally also runs on clean changes so the PR records both scope and expected effects.
         if files and (findings or not errors):
             payload = "\n".join(
-                f"- [{f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}: {f.detail[:400]}"
+                f"- [{priority_for(f.severity)} {f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}: {f.detail[:400]}"
                 for path, f in items[:40]
             ) or "（没有发现需要报告的问题）"
             try:

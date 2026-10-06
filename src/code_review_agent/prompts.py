@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROMPT_VERSION = "5"  # bump when prompts change so cached model results are not reused
+PROMPT_VERSION = "7"  # bump when prompts change so cached model results are not reused
 
 FILE_REVIEW_SYSTEM = """You are a senior software engineer reviewing ONE file of a code change.
 
@@ -34,6 +34,18 @@ Impact rules (only when <impact_evidence> is present):
 Rules:
 - Only comment on added or changed code. Do not praise. Do not restate the code. Skip pure style opinions
   unless they hide a bug. Prefer few, high-confidence findings (at most 8).
+- Report only a concrete, reproducible failure mode with a specific trigger and consequence visible in the supplied
+  diff/context. Do not report hypothetical risks, generic "could be improved" advice, or missing tests just because
+  more tests are possible. A missing-test finding requires a concrete high-impact behavior and evidence that no
+  existing test/guard covers it.
+- For a cross-file/API compatibility claim, cite the exact changed declaration and an actual incompatible caller
+  from <impact_evidence>. If that evidence is absent or ambiguous, do not infer breakage from unseen files.
+- Report one finding per root cause; merge duplicates across chunks and avoid restating the same concern as both
+  a bug and a testing nit. Performance findings require a measured regression or a clearly superlinear resource
+  impact on a stated input scale; avoid speculative micro-optimizations.
+- Use minor only for a specific edge case with an actionable consequence and direct code evidence. Use nit only for
+  objective, low-impact correctness/readability defects, never personal style preferences. Do not emit a nit for an
+  issue that is already covered by a deterministic guard or regression test.
 - Each finding must be actionable and specific. If you are not sure, lower the severity instead of guessing.
 - The diff is annotated: added lines look like "  42 + code" where 42 is the new-file line number.
   Set "line" to such a number for an added line, otherwise null.

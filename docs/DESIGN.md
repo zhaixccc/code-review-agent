@@ -342,7 +342,7 @@ score = 3.0   若是源码后缀（.py .ts .java .go …）
 
 ### 5.6 `verify`：二次验证
 
-扇入点：所有 `review_file` 完成后才执行。对每条 `origin == "model"` 且严重度为 major/critical 的发现，让模型在只看代码证据的前提下**尝试反驳**。原理在第 9 节。
+扇入点：所有 `review_file` 完成后才执行。对每条 `origin == "model"` 且严重度为 critical/major/minor 的发现（受 `VERIFY_MAX_FINDINGS` 限制），让模型在只看代码证据的前提下**尝试反驳**。原理在第 9 节。
 
 ### 5.7 `synthesize`：合并与结论
 
@@ -620,7 +620,7 @@ tree-sitter 是原生代码，解析的又是**攻击者可控的文件**。原�
 
 ### 9.2 机制
 
-对每条 `origin == "model"` 且严重度为 major/critical 的发现（最多 `VERIFY_MAX_FINDINGS`=10 条，并行执行）：
+对每条 `origin == "model"` 且严重度为 critical/major/minor 的发现（最多 `VERIFY_MAX_FINDINGS`=10 条，并行执行）：
 
 ```
 输入：该发现（严重度、类别、行号、标题、详情） + 该行附近 ±15 行的带行号 diff 片段 + 该文件的影响面证据
@@ -631,7 +631,7 @@ tree-sitter 是原生代码，解析的又是**攻击者可控的文件**。原�
 | 裁决 | 处理 |
 |---|---|
 | `refuted` | 剔除这条发现 |
-| `uncertain` | 严重度降一级（critical → major，major → minor） |
+| `uncertain` | 严重度降一级（critical → major → minor → nit/P3） |
 | `confirmed` | 原样保留 |
 | 调用失败 / 无效 JSON | **原样保留**（fail open） |
 
@@ -641,7 +641,8 @@ tree-sitter 是原生代码，解析的又是**攻击者可控的文件**。原�
 
 - **规则发现不参与**：密钥扫描、敏感文件等 `origin == "rule"` 的发现是确定性的，没有模型可以“推翻”它。
 - **每条决定都记录**（`verify_log`），`--explain` 可查看，便于审计。
-- **只作用于 major/critical**：minor 值得花一次调用的不多。
+- **规则发现不参与，P3/nit 不再验证**：规则 finding 确定性生成；nit 已在低噪声策略中仅放汇总。
+- **成本取舍**：minor 也进入有上限的复核队列，用额外 LLM 调用换取对 P2 噪声的筛除；超出 `VERIFY_MAX_FINDINGS` 的按严重度和位置截断。
 
 ### 9.4 它的真实效果（来自评测）
 

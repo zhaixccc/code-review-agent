@@ -42,7 +42,7 @@ flowchart LR
 | `recall_memory` | 仓库、候选路径、commit message → `memory`、`memory_count` | Hindsight 可选；不可用不阻断审查，召回内容作为不可信背景 |
 | `dispatch` | 候选文件 + 共用上下文 → `Send("review_file", FileTask)` 列表 | 条件边动态扇出；无候选文件则直接路由到 `verify`，不创建空的模型任务 |
 | `review_file × N` | 单文件 diff + 对应影响证据 → `file_reviews`、`errors` | 同一 super-step 并行；每个任务只拿本文件所需 payload。两字段使用 `operator.add` reducer 汇总并发写入 |
-| `verify` | `file_reviews` → `verified_reviews`、`verify_log` | 只验证模型产生的 major/critical；反驳则删除，不确定则降级，失败保留原发现。写入独立覆盖键，避免追加 reducer 把新列表再拼到旧列表 |
+| `verify` | `file_reviews` → `verified_reviews`、`verify_log` | 按严重度预算验证模型 critical/major/minor；反驳则删除，不确定则降一级，失败保留原发现。P3/nit 只在汇总中展示、不发逐条行内评论 |
 | `synthesize` | `_final_reviews(state)` → `verdict`、`summary` | `_final_reviews` 优先取 `verified_reviews`，否则取 `file_reviews`；严重度到结论由代码确定，模型只写摘要 |
 | `publish` | 最终 reviews 与目标 → `report`、`posted` | `dry_run` 只渲染；GitHub 发布执行 upsert 与评论去重；全部文件调用失败时不发布误导性的“无问题” |
 | `learn` | 仓库与可信反馈 → Hindsight 记忆 | 可选；dry-run 跳过；失败不影响审查结果 |
@@ -65,7 +65,7 @@ flowchart LR
 | `impact_analysis` | （默认开启）下载被审查提交时的仓库快照，用 tree-sitter 找出 diff 触及的函数/类，再在整个仓库里找它们的**调用方和测试**，把调用方的真实代码片段作为证据交给审查模型。详见下文 |
 | `recall_memory` | （可选）从 Hindsight 召回该仓库的约定与历史反馈，作为不可信背景附加到提示词 |
 | `review_file` | 用 LangGraph `Send` 对每个文件并行调用 DeepSeek；大 diff 分块（超长时按 hunk 保留首尾，不只看开头）；送模型前对疑似密钥打码，并对新增行做确定性密钥扫描；输出结构化 findings；相同输入的结果会缓存（`REVIEW_CACHE`） |
-| `verify` | 二次验证：对每条 major/critical 问题，让模型在只看代码证据的前提下尝试**反驳**。被反驳的剔除，无法证实的降一级，验证调用失败则保留原样；规则产生的发现（密钥扫描等）不参与。每条决定都会记录（`--explain` 可查看） |
+| `verify` | 二次验证：按优先级预算对模型 critical/major/minor 发现，让模型在只看代码证据的前提下尝试**反驳**。被反驳的剔除，不确定则降一级（minor → P3/nit），调用失败保留原样；规则发现不参与。每条决定都会记录（`--explain` 可查看），最多 `VERIFY_MAX_FINDINGS` 条 |
 | `synthesize` | 合并、去重、排序；**结论由代码根据严重度确定**（不由模型决定）；再根据脱敏 diff、文件范围、调用方证据和 findings 生成分节总结：变更概述、影响范围、正向影响、风险/负向影响、优先修复项 |
 | `publish` | push → 提交评论（commit comment，同一提交重复审查时更新而非新增）；PR → 行内评论按已有评论去重 + 一条汇总评论（更新而非新增） |
 | `learn` | （可选）把本次审查沉淀到 Hindsight；`--post` 之外的试跑不写记忆 |
@@ -77,6 +77,7 @@ flowchart LR
 - **失败不误导**：所有文件的模型调用都失败时不会发布“没有问题”的评论；部分失败会在评论里注明结果可能不完整。
 - **成本控制**：文件数、单文件字符数、分块大小、每次 push 最多审查的提交数、并发数均可配置。
 - **安全边界**：Webhook 强制 HMAC 签名校验；可用 `ALLOWED_REPOS` 白名单限制仓库；忽略机器人触发的事件、草稿 PR、合并提交、已删除分支；对重复投递去重。
+- **评论降噪与分级**：severity 映射到 P0（critical）/P1（major）/P2（minor）/P3（nit）；finding 按优先级分组。P3 只留在汇总，不创建行内线程；minor 及以上会受上限约束做反驳式复核。额外复核调用有成本，详见配置项。
 
 ## 快速开始
 
@@ -236,7 +237,7 @@ docker run -p 8888:8888 -p 9999:9999 -e HINDSIGHT_API_LLM_API_KEY=<key> ghcr.io/
 | `IMPACT_MAX_CALLERS` | `4` | 每个符号最多展示的调用方数 |
 | `IMPACT_EVIDENCE_CHARS` | `7000` | 每个文件的影响面证据字符上限 |
 | `SNAPSHOT_MAX_MB` | `80` | 仓库压缩包下载上限 |
-| `VERIFY_FINDINGS` | `true` | 对 major/critical 问题做二次验证 |
+| `VERIFY_FINDINGS` | `true` | 对 critical/major/minor 模型发现做二次验证；不确定的 minor 降为 P3/nit |
 | `VERIFY_MAX_FINDINGS` | `10` | 每次审查最多验证的问题数 |
 | `REVIEW_CACHE` | `true` | 缓存“相同输入”的单文件审查结果 |
 | `STATE_DIR` | 空 | 去重与记忆记账文件位置（跨重启持久化） |
