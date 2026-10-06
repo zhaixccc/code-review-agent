@@ -35,6 +35,16 @@ def test_annotated_added_lines_extracts_only_added_line_anchors():
     assert annotated_added_lines(annotated) == {2, 3, 23}
 
 
+def test_annotated_added_lines_handles_empty_and_non_added_rows():
+    assert annotated_added_lines("") == set()
+    assert annotated_added_lines("      - removed\n    3   context only\n") == set()
+
+
+def test_annotated_added_lines_does_not_confuse_code_text_with_the_anchor():
+    annotated = "    5 + 123 + this is code\n    6   123 + this is context\n"
+    assert annotated_added_lines(annotated) == {5}
+
+
 @pytest.mark.parametrize(
     "name,expected",
     [

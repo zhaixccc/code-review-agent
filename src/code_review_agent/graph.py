@@ -92,17 +92,23 @@ def _summary_context(state: ReviewState) -> str:
             "deletions": file.deletions,
             "impact_evidence": impact,
         }
-        remaining = MAX_SUMMARY_CONTEXT_CHARS - len(encode(data)) - len(encode(base)) - 160
+        empty_entry = {**base, "diff_excerpt": "", "omitted_hunks": 0}
+        minimum_candidate = {**data, "files": [*data["files"], empty_entry]}
+        remaining = MAX_SUMMARY_CONTEXT_CHARS - len(encode(minimum_candidate))
         if remaining <= 0:
             break
         patch, _ = redact(file.patch or "")
         patch_budget = min(MAX_SUMMARY_DIFF_CHARS_PER_FILE, remaining)
-        excerpt, omitted_hunks = trim_patch(patch, patch_budget)
-        entry = {**base, "diff_excerpt": excerpt, "omitted_hunks": omitted_hunks}
-        candidate = {**data, "files": [*data["files"], entry]}
-        if len(encode(candidate)) > MAX_SUMMARY_CONTEXT_CHARS:
+        while patch_budget > 0:
+            excerpt, omitted_hunks = trim_patch(patch, patch_budget)
+            entry = {**base, "diff_excerpt": excerpt, "omitted_hunks": omitted_hunks}
+            candidate = {**data, "files": [*data["files"], entry]}
+            if len(encode(candidate)) <= MAX_SUMMARY_CONTEXT_CHARS:
+                data["files"].append(entry)
+                break
+            patch_budget //= 2
+        else:
             break
-        data["files"].append(entry)
 
     return encode(data)
 
@@ -377,6 +383,7 @@ def build_graph(
         summary = ""
         files = state.get("files", [])
         errors = state.get("errors", [])
+        # This summary call intentionally also runs on clean changes so the PR records both scope and expected effects.
         if files and (findings or not errors):
             payload = "\n".join(
                 f"- [{f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}: {f.detail[:400]}"
