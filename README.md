@@ -42,7 +42,7 @@ flowchart LR
 | `recall_memory` | 仓库、候选路径、commit message → `memory`、`memory_count` | Hindsight 可选；不可用不阻断审查，召回内容作为不可信背景 |
 | `dispatch` | 候选文件 + 共用上下文 → `Send("review_file", FileTask)` 列表 | 条件边动态扇出；无候选文件则直接路由到 `verify`，不创建空的模型任务 |
 | `review_file × N` | 单文件 diff + 对应影响证据 → `file_reviews`、`errors` | 同一 super-step 并行；每个任务只拿本文件所需 payload。两字段使用 `operator.add` reducer 汇总并发写入 |
-| `verify` | `file_reviews` → `verified_reviews`、`verify_log` | 按严重度预算验证模型 critical/major/minor；反驳则删除，不确定则降一级，失败保留原发现。P3/nit 只在汇总中展示、不发逐条行内评论 |
+| `verify` | `file_reviews` → `verified_reviews`、`verify_log` | 按严重度预算验证模型 critical/major/minor；反驳则删除，不确定则降一级，失败保留原发现。 |
 | `synthesize` | `_final_reviews(state)` → `verdict`、`summary` | `_final_reviews` 优先取 `verified_reviews`，否则取 `file_reviews`；严重度到结论由代码确定，模型只写摘要 |
 | `publish` | 最终 reviews 与目标 → `report`、`posted` | `dry_run` 只渲染；GitHub 发布执行 upsert 与评论去重；全部文件调用失败时不发布误导性的“无问题” |
 | `learn` | 仓库与可信反馈 → Hindsight 记忆 | 可选；dry-run 跳过；失败不影响审查结果 |
@@ -77,7 +77,7 @@ flowchart LR
 - **失败不误导**：所有文件的模型调用都失败时不会发布“没有问题”的评论；部分失败会在评论里注明结果可能不完整。
 - **成本控制**：文件数、单文件字符数、分块大小、每次 push 最多审查的提交数、并发数均可配置。
 - **安全边界**：Webhook 强制 HMAC 签名校验；可用 `ALLOWED_REPOS` 白名单限制仓库；忽略机器人触发的事件、草稿 PR、合并提交、已删除分支；对重复投递去重。
-- **评论降噪与分级**：severity 映射到 P0（critical）/P1（major）/P2（minor）/P3（nit）；finding 按优先级分组。P3 只留在汇总，不创建行内线程；minor 及以上会受上限约束做反驳式复核。额外复核调用有成本，详见配置项。
+- **评论降噪与分级**：severity 映射到 P0（critical）/P1（major）/P2（minor）/P3（nit）；finding 按优先级分组。只有 P0/P1 创建行内线程，P2/P3 全部保留在汇总；minor 及以上受预算限制做反驳式复核。额外复核调用有成本，详见配置项。
 
 ## 快速开始
 

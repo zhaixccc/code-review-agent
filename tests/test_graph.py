@@ -202,12 +202,13 @@ def test_pr_report_assigns_p0_to_p3_and_keeps_nits_out_of_inline_threads():
     )
 
     _, _, _, _, inline = github.reviews[0]
-    assert len(inline) == 3
-    assert [comment["body"].split("**[", 1)[1].split(" ·", 1)[0] for comment in inline] == ["P0", "P1", "P2"]
+    assert len(inline) == 2
+    assert [comment["body"].split("**[", 1)[1].split(" ·", 1)[0] for comment in inline] == ["P0", "P1"]
     summary = github.issue_comments[18]
     assert "P0 1 · P1 1 · P2 1 · P3 1" in summary
+    assert "**[P2 · 中/缺陷]** Minor" in summary
     assert "**[P3 · 提示/规范]** Nit" in summary
-    assert "P3 nit 仅列于汇总" in summary
+    assert "P2/P3 留在汇总" in summary
 
 
 def test_pr_review_over_inline_limit_batches_comments_and_retains_rejected_findings():
@@ -227,7 +228,7 @@ def test_pr_review_over_inline_limit_batches_comments_and_retains_rejected_findi
                 }))
             filename = messages[1].content.splitlines()[0].removeprefix("File: ")
             return FakeMessage(json.dumps({"findings": [{
-                "severity": "minor",
+                "severity": "major",
                 "category": "bug",
                 "line": 1,
                 "title": f"Finding in {filename}",

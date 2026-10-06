@@ -146,10 +146,11 @@ def render_report(
             1 for path, finding in items
             if inline_paths is not None and finding.line is not None and (path, finding.line) in inline_paths
         )
+        lower_priority = any(finding.severity in {"minor", "nit"} for _, finding in items)
         if inline_published_count:
-            parts.append(f"_已发布 {inline_published_count} 条行内评论；P3 nit 仅列于汇总，避免行内评论噪声。_")
-        elif any(finding.severity == "nit" for _, finding in items):
-            parts.append("_P3 nit 仅列于汇总，避免行内评论噪声。_")
+            parts.append(f"_已发布 {inline_published_count} 条 P0/P1 行内评论；P2/P3 留在汇总，避免低优先级线程噪声。_")
+        elif lower_priority:
+            parts.append("_P2/P3 仅列于汇总，避免低优先级行内评论噪声。_")
     else:
         parts.append("本次提交的可审查改动中没有发现需要报告的问题。")
     reviewed = len(file_reviews)
@@ -175,8 +176,8 @@ def build_inline_comments(file_reviews: list[FileReview]) -> list[dict[str, Any]
     for review in file_reviews:
         valid = set(review.valid_lines)
         for finding in review.findings:
-            # Nits remain visible in the priority-grouped summary, but do not create noisy inline threads.
-            if finding.severity == "nit":
+            # Only urgent/high-priority findings open inline threads; P2/P3 stay in the full summary.
+            if finding.severity not in {"critical", "major"}:
                 continue
             if finding.line and finding.line in valid:
                 severity = SEVERITY_LABEL.get(finding.severity, finding.severity)
