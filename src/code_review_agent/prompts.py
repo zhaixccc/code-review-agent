@@ -121,6 +121,7 @@ redacted JSON snapshot; omitted hunks and files may mean the evidence is incompl
 In {language}, fill all five fields:
 - change: what behavior or capability was added/changed, grounded in the visible diff.
 - scope: files/components affected and any caller/impact evidence explicitly present in the context.
+  If files_omitted is greater than zero, explicitly state that the summarized scope is incomplete and give the omitted count.
 - benefits: concrete positive effect for users or maintainers; if the diff does not establish one, say it cannot be
   determined from the diff. Do not invent performance, coverage, or user outcomes.
 - risks: negative side effects, compatibility/security/performance risks supported by the diff and findings. If no

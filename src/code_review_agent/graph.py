@@ -74,9 +74,11 @@ MAX_SUMMARY_DIFF_CHARS_PER_FILE = 1_800
 
 def _summary_context(state: ReviewState) -> str:
     """Build a bounded, redacted JSON context for the change-impact summary call."""
+    raw_files = state.get("files", [])
     data: dict[str, Any] = {
         "impact_summary": [redact(str(item))[0][:400] for item in state.get("impact_summary", [])[:8]],
         "skipped": [str(item)[:180] for item in state.get("skipped", [])[:12]],
+        "files_omitted": len(raw_files),
         "files": [],
     }
 
@@ -84,7 +86,7 @@ def _summary_context(state: ReviewState) -> str:
         # Prevent untrusted diff text from closing the surrounding prompt tag.
         return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
-    for raw in state.get("files", []):
+    for raw in raw_files:
         file = ChangedFile.model_validate(raw)
         impact = redact(str((state.get("impact") or {}).get(file.filename, "")))[0][:1200]
         base = {
@@ -103,7 +105,8 @@ def _summary_context(state: ReviewState) -> str:
         while patch_budget > 0:
             excerpt, omitted_hunks = trim_patch(patch, patch_budget)
             entry = {**base, "diff_excerpt": excerpt, "omitted_hunks": omitted_hunks}
-            candidate = {**data, "files": [*data["files"], entry]}
+            candidate_files = [*data["files"], entry]
+            candidate = {**data, "files": candidate_files, "files_omitted": len(raw_files) - len(candidate_files)}
             if len(encode(candidate)) <= MAX_SUMMARY_CONTEXT_CHARS:
                 data["files"].append(entry)
                 break

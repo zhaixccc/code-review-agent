@@ -186,6 +186,30 @@ def test_pr_review_posts_inline_for_new_findings_and_a_summary_comment():
     assert "Bad anchor" in summary
 
 
+def test_pr_report_assigns_p0_to_p3_and_keeps_nits_out_of_inline_threads():
+    findings = [
+        {"severity": "critical", "category": "security", "line": 1, "title": "Critical", "detail": "High risk."},
+        {"severity": "major", "category": "bug", "line": 2, "title": "Major", "detail": "Breaks behavior."},
+        {"severity": "minor", "category": "bug", "line": 3, "title": "Minor", "detail": "Edge case."},
+        {"severity": "nit", "category": "style", "line": 4, "title": "Nit", "detail": "Low impact."},
+    ]
+    patch = "@@ -0,0 +1,4 @@\n+line1\n+line2\n+line3\n+line4\n"
+    github = FakeGitHub(files=[ChangedFile(filename="src/priorities.py", additions=4, patch=patch)])
+    run(
+        FakeLLM(json.dumps({"findings": findings})),
+        github,
+        ReviewTarget(repo="o/r", sha="c" * 40, pr_number=18),
+    )
+
+    _, _, _, _, inline = github.reviews[0]
+    assert len(inline) == 3
+    assert [comment["body"].split("**[", 1)[1].split(" ·", 1)[0] for comment in inline] == ["P0", "P1", "P2"]
+    summary = github.issue_comments[18]
+    assert "P0 1 · P1 1 · P2 1 · P3 1" in summary
+    assert "**[P3 · nit/style]** Nit" in summary
+    assert "P3 nit 仅列于汇总" in summary
+
+
 def test_pr_review_over_inline_limit_batches_comments_and_retains_rejected_findings():
     class ManyFindingsLLM:
         def __init__(self):
@@ -311,6 +335,7 @@ def test_summary_context_stays_bounded_valid_json_and_escapes_prompt_tag_text():
     context = _summary_context(state)
     decoded = json.loads(context)
     assert len(context) <= MAX_SUMMARY_CONTEXT_CHARS
+    assert decoded["files_omitted"] > 0
     assert "</change_context_json>" not in context
     assert "\\u003c/change_context_json\\u003e" in context
     assert decoded["files"] and decoded["files"][0]["diff_excerpt"]

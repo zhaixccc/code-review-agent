@@ -118,7 +118,6 @@ def render_report(
         }
         parts.append("**处置优先级：** " + " · ".join(f"{priority} {count}" for priority, count in priority_counts.items() if count))
         parts.append("### 发现的问题")
-        rendered_inline = False
         for priority in PRIORITY_ORDER:
             group = [(path, finding) for path, finding in items if priority_for(finding.severity) == priority]
             visible = [
@@ -127,14 +126,17 @@ def render_report(
                 if inline_paths is None or finding.line is None or (path, finding.line) not in inline_paths
             ]
             if not visible:
-                rendered_inline = rendered_inline or bool(group)
                 continue
             parts.append(f"#### {priority}")
             parts.extend(render_finding(path, finding) for path, finding in visible)
-        if rendered_inline:
-            parts.append("_部分高优先级问题已作为行内评论发布。P3 nit 仅列于汇总，避免行内评论噪声。_")
-        if inline_paths and any(finding.line and (path, finding.line) in inline_paths for path, finding in items):
-            parts.append("_部分问题已作为行内评论发布。_")
+        inline_published_count = sum(
+            1 for path, finding in items
+            if inline_paths is not None and finding.line is not None and (path, finding.line) in inline_paths
+        )
+        if inline_published_count:
+            parts.append(f"_已发布 {inline_published_count} 条行内评论；P3 nit 仅列于汇总，避免行内评论噪声。_")
+        elif any(finding.severity == "nit" for _, finding in items):
+            parts.append("_P3 nit 仅列于汇总，避免行内评论噪声。_")
     else:
         parts.append("本次提交的可审查改动中没有发现需要报告的问题。")
     reviewed = len(file_reviews)
