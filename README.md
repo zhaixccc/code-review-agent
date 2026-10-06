@@ -241,7 +241,7 @@ docker run -p 8888:8888 -p 9999:9999 -e HINDSIGHT_API_LLM_API_KEY=<key> ghcr.io/
 | `VERIFY_MAX_FINDINGS` | `10` | 每次审查最多验证的问题数 |
 | `REVIEW_CACHE` | `true` | 缓存“相同输入”的单文件审查结果 |
 | `STATE_DIR` | 空 | 去重与记忆记账文件位置（跨重启持久化） |
-| `REVIEW_LANGUAGE` | `Simplified Chinese` | 评论语言 |
+| 评论语言 | 简体中文（固定） | finding、摘要、验证理由及严重度/类别标签统一中文；代码符号、路径、API 名称保留原文 |
 
 ## 隐私与限制
 

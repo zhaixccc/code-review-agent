@@ -23,6 +23,15 @@ VERDICT_TEXT = {
 }
 PRIORITY_BY_SEVERITY = {"critical": "P0", "major": "P1", "minor": "P2", "nit": "P3"}
 PRIORITY_ORDER = ("P0", "P1", "P2", "P3")
+SEVERITY_LABEL = {"critical": "紧急", "major": "高", "minor": "中", "nit": "提示"}
+CATEGORY_LABEL = {
+    "bug": "缺陷",
+    "security": "安全",
+    "performance": "性能",
+    "maintainability": "可维护性",
+    "testing": "测试",
+    "style": "规范",
+}
 
 
 def priority_for(severity: str) -> str:
@@ -51,7 +60,9 @@ def collect(file_reviews: list[FileReview]) -> list[tuple[str, Finding]]:
 
 def render_finding(path: str, finding: Finding, with_location: bool = True) -> str:
     location = f"`{path}:{finding.line}`" if finding.line else f"`{path}`"
-    head = f"**[{priority_for(finding.severity)} · {finding.severity}/{finding.category}]** {sanitize(finding.title)}"
+    severity = SEVERITY_LABEL.get(finding.severity, finding.severity)
+    category = CATEGORY_LABEL.get(finding.category, finding.category)
+    head = f"**[{priority_for(finding.severity)} · {severity}/{category}]** {sanitize(finding.title)}"
     lines = [f"- {head}" + (f" — {location}" if with_location else "")]
     lines.append(f"  {sanitize(finding.detail)}")
     if finding.suggestion:
@@ -111,7 +122,9 @@ def render_report(
     if impact_summary:
         parts.append("### 影响面\n" + "\n".join(f"- {sanitize(line)}" for line in impact_summary))
     if items:
-        parts.append("**问题统计：** " + " · ".join(f"{name} {count}" for name, count in counts.items() if count))
+        parts.append("**问题统计：** " + " · ".join(
+            f"{SEVERITY_LABEL.get(name, name)} {count}" for name, count in counts.items() if count
+        ))
         priority_counts = {
             priority: sum(1 for _, finding in items if priority_for(finding.severity) == priority)
             for priority in PRIORITY_ORDER
@@ -166,7 +179,9 @@ def build_inline_comments(file_reviews: list[FileReview]) -> list[dict[str, Any]
             if finding.severity == "nit":
                 continue
             if finding.line and finding.line in valid:
-                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{priority_for(finding.severity)} · {finding.severity}/{finding.category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
+                severity = SEVERITY_LABEL.get(finding.severity, finding.severity)
+                category = CATEGORY_LABEL.get(finding.category, finding.category)
+                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{priority_for(finding.severity)} · {severity}/{category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
                 if finding.suggestion:
                     body += f"\n\n建议：{sanitize(finding.suggestion)}"
                 comments.append({"path": review.filename, "line": finding.line, "side": "RIGHT", "body": body})

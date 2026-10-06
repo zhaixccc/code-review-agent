@@ -206,7 +206,7 @@ def test_pr_report_assigns_p0_to_p3_and_keeps_nits_out_of_inline_threads():
     assert [comment["body"].split("**[", 1)[1].split(" ·", 1)[0] for comment in inline] == ["P0", "P1", "P2"]
     summary = github.issue_comments[18]
     assert "P0 1 · P1 1 · P2 1 · P3 1" in summary
-    assert "**[P3 · nit/style]** Nit" in summary
+    assert "**[P3 · 提示/规范]** Nit" in summary
     assert "P3 nit 仅列于汇总" in summary
 
 
