@@ -21,6 +21,22 @@ VERDICT_TEXT = {
     "comment": "有若干建议，请作者评估",
     "approve": "未发现明显问题",
 }
+PRIORITY_BY_SEVERITY = {"critical": "P0", "major": "P1", "minor": "P2", "nit": "P3"}
+PRIORITY_ORDER = ("P0", "P1", "P2", "P3")
+SEVERITY_LABEL = {"critical": "紧急", "major": "高", "minor": "中", "nit": "提示"}
+CATEGORY_LABEL = {
+    "bug": "缺陷",
+    "security": "安全",
+    "performance": "性能",
+    "maintainability": "可维护性",
+    "testing": "测试",
+    "style": "规范",
+}
+
+
+def priority_for(severity: str) -> str:
+    """Map review severity to an explicit triage priority for humans."""
+    return PRIORITY_BY_SEVERITY.get(severity, "P3")
 
 
 def sanitize(text: str) -> str:
@@ -44,7 +60,9 @@ def collect(file_reviews: list[FileReview]) -> list[tuple[str, Finding]]:
 
 def render_finding(path: str, finding: Finding, with_location: bool = True) -> str:
     location = f"`{path}:{finding.line}`" if finding.line else f"`{path}`"
-    head = f"**[{finding.severity}/{finding.category}]** {sanitize(finding.title)}"
+    severity = SEVERITY_LABEL.get(finding.severity, finding.severity)
+    category = CATEGORY_LABEL.get(finding.category, finding.category)
+    head = f"**[{priority_for(finding.severity)} · {severity}/{category}]** {sanitize(finding.title)}"
     lines = [f"- {head}" + (f" — {location}" if with_location else "")]
     lines.append(f"  {sanitize(finding.detail)}")
     if finding.suggestion:
@@ -94,6 +112,7 @@ def render_report(
     impact_summary: list[str] | None = None,
     verify_dropped: int = 0,
     verify_downgraded: int = 0,
+    inline_omitted_count: int = 0,
 ) -> str:
     items = collect(file_reviews)
     counts = {severity: sum(1 for _, finding in items if finding.severity == severity) for severity in SEVERITY_ORDER}
@@ -103,15 +122,35 @@ def render_report(
     if impact_summary:
         parts.append("### 影响面\n" + "\n".join(f"- {sanitize(line)}" for line in impact_summary))
     if items:
-        parts.append("**问题统计：** " + " · ".join(f"{name} {count}" for name, count in counts.items() if count))
+        parts.append("**问题统计：** " + " · ".join(
+            f"{SEVERITY_LABEL.get(name, name)} {count}" for name, count in counts.items() if count
+        ))
+        priority_counts = {
+            priority: sum(1 for _, finding in items if priority_for(finding.severity) == priority)
+            for priority in PRIORITY_ORDER
+        }
+        parts.append("**处置优先级（含行内评论）：** " + " · ".join(f"{priority} {count}" for priority, count in priority_counts.items() if count))
         parts.append("### 发现的问题")
-        for path, finding in items:
-            anchored_inline = inline_paths is not None and finding.line is not None and (path, finding.line) in inline_paths
-            if anchored_inline:
+        for priority in PRIORITY_ORDER:
+            group = [(path, finding) for path, finding in items if priority_for(finding.severity) == priority]
+            visible = [
+                (path, finding)
+                for path, finding in group
+                if inline_paths is None or finding.line is None or (path, finding.line) not in inline_paths
+            ]
+            if not visible:
                 continue
-            parts.append(render_finding(path, finding))
-        if inline_paths and any(finding.line and (path, finding.line) in inline_paths for path, finding in items):
-            parts.append("_部分问题已作为行内评论发布。_")
+            parts.append(f"#### {priority}")
+            parts.extend(render_finding(path, finding) for path, finding in visible)
+        inline_published_count = sum(
+            1 for path, finding in items
+            if inline_paths is not None and finding.line is not None and (path, finding.line) in inline_paths
+        )
+        lower_priority = any(finding.severity in {"minor", "nit"} for _, finding in items)
+        if inline_published_count:
+            parts.append(f"_已发布 {inline_published_count} 条 P0/P1 行内评论；P2/P3 留在汇总，避免低优先级线程噪声。_")
+        elif lower_priority:
+            parts.append("_P2/P3 仅列于汇总，避免低优先级行内评论噪声。_")
     else:
         parts.append("本次提交的可审查改动中没有发现需要报告的问题。")
     reviewed = len(file_reviews)
@@ -124,6 +163,8 @@ def render_report(
         notes.append(f"参考了 {memory_used} 条项目记忆（Hindsight）")
     if verify_dropped or verify_downgraded:
         notes.append(f"二次验证：剔除 {verify_dropped} 条、降级 {verify_downgraded} 条未能证实的问题")
+    if inline_omitted_count:
+        notes.append(f"另有 {inline_omitted_count} 条问题未能作为行内评论发布，已保留在本汇总中")
     parts.append("---")
     parts.append("<sub>" + "；".join(sanitize(note) for note in notes) + f"。由 LangGraph + DeepSeek（{model}）自动生成，仅供参考，请人工复核。</sub>")
     return "\n\n".join(parts)
@@ -135,8 +176,13 @@ def build_inline_comments(file_reviews: list[FileReview]) -> list[dict[str, Any]
     for review in file_reviews:
         valid = set(review.valid_lines)
         for finding in review.findings:
+            # Only urgent/high-priority findings open inline threads; P2/P3 stay in the full summary.
+            if finding.severity not in {"critical", "major"}:
+                continue
             if finding.line and finding.line in valid:
-                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{finding.severity}/{finding.category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
+                severity = SEVERITY_LABEL.get(finding.severity, finding.severity)
+                category = CATEGORY_LABEL.get(finding.category, finding.category)
+                body = f"{INLINE_MARKER} fp={fingerprint(review.filename, finding)} -->\n**[{priority_for(finding.severity)} · {severity}/{category}]** {sanitize(finding.title)}\n\n{sanitize(finding.detail)}"
                 if finding.suggestion:
                     body += f"\n\n建议：{sanitize(finding.suggestion)}"
                 comments.append({"path": review.filename, "line": finding.line, "side": "RIGHT", "body": body})

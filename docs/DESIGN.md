@@ -342,13 +342,17 @@ score = 3.0   若是源码后缀（.py .ts .java .go …）
 
 ### 5.6 `verify`：二次验证
 
-扇入点：所有 `review_file` 完成后才执行。对每条 `origin == "model"` 且严重度为 major/critical 的发现，让模型在只看代码证据的前提下**尝试反驳**。原理在第 9 节。
+扇入点：所有 `review_file` 完成后才执行。对每条 `origin == "model"` 且严重度为 critical/major/minor 的发现（受 `VERIFY_MAX_FINDINGS` 限制），让模型在只看代码证据的前提下**尝试反驳**。原理在第 9 节。
 
 ### 5.7 `synthesize`：合并与结论
 
 - 合并所有发现，按严重度、文件、行号排序。
 - **结论由代码决定**：存在 critical 或 major → `request_changes`；仅有 minor/nit → `comment`；没有发现 → `approve`。模型不参与（P6）。
-- 有发现时才调用模型写 2 到 4 句话的总结，输入只是发现的标题列表，并声明为不可信数据。
+- finding severity 映射为 **P0 critical / P1 major / P2 minor / P3 nit**；汇总按优先级分组并显示含行内评论的总数。为控制 Review 噪声，只有 P0/P1 建立行内线程，P2/P3 仍完整保留在汇总中。
+- 对有审查文件的正常运行调用总结模型（包括 clean review），输出五个分节：**变更概述、影响范围、正向影响、风险与负向影响、优先处理**。这样即使没有 finding，作者也能看到改动意图及可从 diff 判断的收益/限制。
+- 总结上下文包含入选文件路径和增删行数、受预算限制的 diff 摘要、tree-sitter 影响面摘要、跳过项及 finding 的标题/详情。diff 和影响证据先脱敏；总结输入总预算 12000 字符、单文件 diff 最多 1800 字符，明确标注省略 hunk。
+- **不夸大正向效果**：系统提示要求收益必须有 diff 证据支持；没有依据时明确写“无法从 diff 判断”。风险部分只写可证实的负面影响，不把“没有 finding”说成“零风险”。模型输出仍经 JSON 提取和评论净化，结论不由模型决定。
+- 总结不输出调用方证据以外的推测；reviewer 输出作为不可信内容处理。增加总结调用会多一次 LLM 请求，clean review 也会产生该调用成本。
 
 ### 5.8 `publish`：写回 GitHub
 
@@ -617,7 +621,7 @@ tree-sitter 是原生代码，解析的又是**攻击者可控的文件**。原�
 
 ### 9.2 机制
 
-对每条 `origin == "model"` 且严重度为 major/critical 的发现（最多 `VERIFY_MAX_FINDINGS`=10 条，并行执行）：
+对每条 `origin == "model"` 且严重度为 critical/major/minor 的发现（最多 `VERIFY_MAX_FINDINGS`=10 条，并行执行）：
 
 ```
 输入：该发现（严重度、类别、行号、标题、详情） + 该行附近 ±15 行的带行号 diff 片段 + 该文件的影响面证据
@@ -628,7 +632,7 @@ tree-sitter 是原生代码，解析的又是**攻击者可控的文件**。原�
 | 裁决 | 处理 |
 |---|---|
 | `refuted` | 剔除这条发现 |
-| `uncertain` | 严重度降一级（critical → major，major → minor） |
+| `uncertain` | 严重度降一级（critical → major → minor → nit/P3） |
 | `confirmed` | 原样保留 |
 | 调用失败 / 无效 JSON | **原样保留**（fail open） |
 
@@ -638,7 +642,8 @@ tree-sitter 是原生代码，解析的又是**攻击者可控的文件**。原�
 
 - **规则发现不参与**：密钥扫描、敏感文件等 `origin == "rule"` 的发现是确定性的，没有模型可以“推翻”它。
 - **每条决定都记录**（`verify_log`），`--explain` 可查看，便于审计。
-- **只作用于 major/critical**：minor 值得花一次调用的不多。
+- **规则发现不参与，P3/nit 不再验证**：规则 finding 确定性生成；nit 已在低噪声策略中仅放汇总。
+- **成本取舍**：minor 也进入有上限的复核队列，用额外 LLM 调用换取对 P2 噪声的筛除；超出 `VERIFY_MAX_FINDINGS` 的按严重度和位置截断。
 
 ### 9.4 它的真实效果（来自评测）
 

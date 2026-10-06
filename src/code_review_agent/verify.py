@@ -1,4 +1,4 @@
-"""Second-pass verification: a skeptical model call tries to refute each major/critical finding before it is published.
+"""Second-pass verification: a skeptical model call tries to refute critical/major/minor model findings.
 
 Why: one model pass produces plausible-sounding false positives, and a verdict of "request changes" built on them
 makes people ignore the bot. Verification only ever *removes or lowers* findings; it never adds any, and it
@@ -25,7 +25,7 @@ from .secrets_guard import redact
 
 logger = logging.getLogger(__name__)
 
-_DOWNGRADE = {"critical": "major", "major": "minor"}
+_DOWNGRADE = {"critical": "major", "major": "minor", "minor": "nit"}
 _ROW_NUMBER = re.compile(r"^\s*(\d+)[ +]")
 _CONTEXT_LINES = 15
 _MAX_EXCERPT_CHARS = 4000

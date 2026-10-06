@@ -19,6 +19,7 @@ fetch_changes -> triage -> impact_analysis -> recall_memory -> (fan out: one rev
 
 from __future__ import annotations
 
+import json
 import logging
 import operator
 from typing import Annotated, Any, TypedDict
@@ -30,8 +31,8 @@ from langgraph.types import Send
 
 from .cache import ReviewCache
 from .config import Settings
-from .diff_utils import annotate_patch, chunk_text, should_review, trim_patch
-from .github_client import GitHubClient, GitHubError
+from .diff_utils import chunk_text, prepare_review_patch, should_review, trim_patch
+from .github_client import GitHubClient, GitHubError, MAX_INLINE_REVIEW_COMMENTS
 from .impact import analyze_impact
 from .isolation import run_isolated
 from .llm import extract_json
@@ -53,6 +54,7 @@ from .report import (
     collect,
     existing_fingerprints,
     fingerprint_from_body,
+    priority_for,
     render_report,
     verdict_for,
 )
@@ -66,6 +68,53 @@ MAX_FINDINGS_PER_CHUNK = 8
 MAX_FINDINGS_PER_FILE = 12
 MAX_SECRET_FINDINGS_PER_FILE = 5
 MAX_MESSAGE_CHARS = 2000
+MAX_SUMMARY_CONTEXT_CHARS = 12_000
+MAX_SUMMARY_DIFF_CHARS_PER_FILE = 1_800
+
+
+def _summary_context(state: ReviewState) -> str:
+    """Build a bounded, redacted JSON context for the change-impact summary call."""
+    raw_files = state.get("files", [])
+    data: dict[str, Any] = {
+        "impact_summary": [redact(str(item))[0][:400] for item in state.get("impact_summary", [])[:8]],
+        "skipped": [str(item)[:180] for item in state.get("skipped", [])[:12]],
+        "files_omitted": len(raw_files),
+        "files": [],
+    }
+
+    def encode(value: Any) -> str:
+        # Prevent untrusted diff text from closing the surrounding prompt tag.
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+    for raw in raw_files:
+        file = ChangedFile.model_validate(raw)
+        impact = redact(str((state.get("impact") or {}).get(file.filename, "")))[0][:1200]
+        base = {
+            "path": file.filename[:240],
+            "additions": file.additions,
+            "deletions": file.deletions,
+            "impact_evidence": impact,
+        }
+        empty_entry = {**base, "diff_excerpt": "", "omitted_hunks": 0}
+        minimum_candidate = {**data, "files": [*data["files"], empty_entry]}
+        remaining = MAX_SUMMARY_CONTEXT_CHARS - len(encode(minimum_candidate))
+        if remaining <= 0:
+            continue
+        patch, _ = redact(file.patch or "")
+        patch_budget = min(MAX_SUMMARY_DIFF_CHARS_PER_FILE, remaining)
+        while patch_budget > 0:
+            excerpt, omitted_hunks = trim_patch(patch, patch_budget)
+            entry = {**base, "diff_excerpt": excerpt, "omitted_hunks": omitted_hunks}
+            candidate_files = [*data["files"], entry]
+            candidate = {**data, "files": candidate_files, "files_omitted": len(raw_files) - len(candidate_files)}
+            if len(encode(candidate)) <= MAX_SUMMARY_CONTEXT_CHARS:
+                data["files"].append(entry)
+                break
+            patch_budget //= 2
+        else:
+            continue
+
+    return encode(data)
 
 
 class ReviewState(TypedDict, total=False):
@@ -217,14 +266,19 @@ def build_graph(
 
     def review_file(task: FileTask) -> dict[str, Any]:
         file = ChangedFile.model_validate(task["file"])
-        trimmed, omitted_hunks = trim_patch(file.patch or "", settings.max_patch_chars_per_file)
-        truncated = omitted_hunks > 0 or len(trimmed) < len(file.patch or "")
-        annotated, valid_lines = annotate_patch(trimmed)
+        (
+            annotated,
+            omitted_hunks,
+            full_valid_lines,
+            model_valid_lines,
+            truncated,
+            full_annotated,
+        ) = prepare_review_patch(file.patch or "", settings.max_patch_chars_per_file)
 
-        # Deterministic secret findings come from the raw text; the model only ever sees the redacted text.
+        # Deterministic secret findings cover all added lines; the model only ever sees the trimmed, redacted text.
         deterministic: list[Finding] = []
         seen_secrets: set[tuple[int, str]] = set()
-        for line, kind in scan_added_lines(annotated):
+        for line, kind in scan_added_lines(full_annotated):
             if (line, kind) not in seen_secrets and len(deterministic) < MAX_SECRET_FINDINGS_PER_FILE:
                 seen_secrets.add((line, kind))
                 deterministic.append(secret_finding(kind, line))
@@ -279,11 +333,15 @@ def build_graph(
             cache.put(cache_key, [finding.model_dump() for finding in model_findings])
         findings: list[Finding] = [*deterministic, *model_findings]
 
-        # Only keep line anchors that really exist on added lines; otherwise report without a line.
+        # Only keep line anchors that really exist on added lines; model findings must also be visible to the model.
         seen: set[tuple[int | None, str]] = set()
         cleaned: list[Finding] = []
-        for finding in findings:
-            if finding.line is not None and finding.line not in valid_lines:
+        findings_with_anchors = [
+            *((finding, full_valid_lines) for finding in deterministic),
+            *((finding, model_valid_lines) for finding in model_findings),
+        ]
+        for finding, allowed_lines in findings_with_anchors:
+            if finding.line is not None and finding.line not in allowed_lines:
                 finding = finding.model_copy(update={"line": None})
             key = (finding.line, finding.title.strip().lower())
             if key not in seen:
@@ -292,7 +350,7 @@ def build_graph(
         review = FileReview(
             filename=file.filename,
             findings=cleaned[:MAX_FINDINGS_PER_FILE],
-            valid_lines=sorted(valid_lines),
+            valid_lines=sorted(full_valid_lines),
             truncated=truncated,
         )
         update: dict[str, Any] = {"errors": errors}
@@ -330,17 +388,38 @@ def build_graph(
         findings = [finding for _, finding in items]
         verdict = verdict_for(findings)
         summary = ""
-        if findings:
-            payload = "\n".join(f"- [{f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}" for path, f in items[:40])
+        files = state.get("files", [])
+        errors = state.get("errors", [])
+        # This summary call intentionally also runs on clean changes so the PR records both scope and expected effects.
+        if files and (findings or not errors):
+            payload = "\n".join(
+                f"- [{priority_for(f.severity)} {f.severity}/{f.category}] {path}:{f.line or '-'} {f.title}: {f.detail[:400]}"
+                for path, f in items[:40]
+            ) or "（没有发现需要报告的问题）"
             try:
                 response = llm.invoke(
                     [
                         SystemMessage(content=SUMMARY_SYSTEM.format(language=settings.review_language)),
-                        HumanMessage(content=SUMMARY_USER.format(message=state.get("commit_message", ""), findings=payload)),
+                        HumanMessage(content=SUMMARY_USER.format(
+                            message=state.get("commit_message", ""),
+                            change_context=_summary_context(state),
+                            findings=payload,
+                        )),
                     ]
                 )
                 data = extract_json(response.content) or {}
-                summary = str(data.get("summary", ""))[:1500]
+                sections = (
+                    ("变更概述", data.get("change")),
+                    ("影响范围", data.get("scope")),
+                    ("正向影响", data.get("benefits")),
+                    ("风险与负向影响", data.get("risks")),
+                    ("优先处理", data.get("fix_first")),
+                )
+                summary = "\n\n".join(
+                    f"### {title}\n{str(value).strip()[:700]}"
+                    for title, value in sections
+                    if isinstance(value, str) and value.strip()
+                )[:3500]
             except Exception as error:
                 logger.warning("Summary request failed: %s", type(error).__name__)
         return {"verdict": verdict, "summary": summary}
@@ -348,6 +427,8 @@ def build_graph(
     def publish(state: ReviewState) -> dict[str, Any]:
         target = ReviewTarget.model_validate(state["target"])
         reviews = _final_reviews(state)
+
+        inline_omitted_count = 0
 
         def render(inline_keys: set[tuple[str, int]] | None = None) -> str:
             return render_report(
@@ -363,6 +444,7 @@ def build_graph(
                 impact_summary=state.get("impact_summary", []),
                 verify_dropped=int(state.get("verify_dropped", 0)),
                 verify_downgraded=int(state.get("verify_downgraded", 0)),
+                inline_omitted_count=inline_omitted_count,
             )
 
         if dry_run:
@@ -384,14 +466,32 @@ def build_graph(
                     return fingerprint_from_body(comment["body"]) in fingerprints or (comment["path"], comment["line"]) in anchors
 
                 fresh = [comment for comment in inline_all if not already(comment)]
-                posted_ok = True
-                if fresh:
-                    posted_ok = github.post_pull_request_review(
-                        target.repo, target.pr_number, target.sha, f"自动代码审查：新增 {len(fresh)} 条行内评论，汇总见 PR 评论。", fresh
-                    )
-                keys = {(c["path"], c["line"]) for c in inline_all if already(c) or (posted_ok and c in fresh)}
-                github.upsert_issue_comment(target.repo, target.pr_number, render(keys or None), MARKER)
-                return {"report": render(keys or None), "posted": True}
+                posted_inline: list[dict[str, Any]] = []
+                for offset in range(0, len(fresh), MAX_INLINE_REVIEW_COMMENTS):
+                    batch = fresh[offset : offset + MAX_INLINE_REVIEW_COMMENTS]
+                    try:
+                        posted = github.post_pull_request_review(
+                            target.repo,
+                            target.pr_number,
+                            target.sha,
+                            f"自动代码审查：本批新增 {len(batch)} 条行内评论，汇总见 PR 评论。",
+                            batch,
+                        )
+                    except GitHubError as error:
+                        logger.warning("Inline review batch failed (%s); retaining its findings in the summary.", error.status_code)
+                        posted = False
+                    if posted:
+                        posted_inline.extend(batch)
+                keys = {
+                    (c["path"], c["line"])
+                    for c in inline_all
+                    if already(c) or c in posted_inline
+                }
+                omitted_count = len(fresh) - len(posted_inline)
+                inline_omitted_count = omitted_count
+                report = render(keys or None)
+                github.upsert_issue_comment(target.repo, target.pr_number, report, MARKER)
+                return {"report": report, "posted": True}
             report = render()
             github.upsert_commit_comment(target.repo, target.sha, report, MARKER)
             return {"report": report, "posted": True}
