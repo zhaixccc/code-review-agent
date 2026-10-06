@@ -51,7 +51,7 @@ Push 后到 GitHub 创建 PR。PR 是较适合展示的方式：审查结果会�
 ```powershell
 .\.venv\Scripts\python.exe -m code_review_agent review `
   --repo zhaixccc/code-review-agent `
-  --sha <刚推送的完整 commit SHA> `
+  --sha "YOUR_FULL_COMMIT_SHA" `
   --explain
 ```
 
@@ -65,8 +65,8 @@ Push 后到 GitHub 创建 PR。PR 是较适合展示的方式：审查结果会�
 ```powershell
 .\.venv\Scripts\python.exe -m code_review_agent review `
   --repo zhaixccc/code-review-agent `
-  --sha <PR当前head commit SHA> `
-  --pr <PR编号> `
+  --sha "PR_HEAD_COMMIT_SHA" `
+  --pr 123 `
   --explain
 ```
 
